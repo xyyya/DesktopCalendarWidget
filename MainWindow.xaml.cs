@@ -15,7 +15,7 @@ using System.Windows.Threading;
 
 namespace DesktopCalendarWidget
 {
-    // 🔴 日期任务标记转换器：仅当指定日期有“未完成”任务时显示小蓝点
+    // 日期任务标记转换器：仅当指定日期有“未完成”任务时显示小蓝点
     public class TaskDayToVisibilityConverter : IValueConverter
     {
         public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
@@ -66,8 +66,11 @@ namespace DesktopCalendarWidget
             InitializeComponent();
             LoadTasks();
             LoadSettings();
-            InitEdgeHideTimer();
 
+            // 🔴 补全：启动时根据已保存设置，自动同步注册表开机自启动状态
+            ApplyAutoStartRegistry(_currentSettings.IsAutoStartEnabled);
+
+            InitEdgeHideTimer();
             MainCalendar.SelectedDate = DateTime.Today;
         }
 
@@ -247,7 +250,7 @@ namespace DesktopCalendarWidget
             Brush GetBrush(string hex) => (Brush?)new BrushConverter().ConvertFrom(hex) ?? Brushes.Gray;
             DateTime selectedDate = (MainCalendar.SelectedDate ?? DateTime.Today).Date;
 
-            // 🔵 关键改动：打卡完成后自动沉底（按照 未完成在上、已完成在下 排序）
+            // 🔵 打卡完成后自动沉底（按 未完成在上、已完成在下 排序）
             var matchedTasks = _allTasks
                 .Where(t => IsTaskMatchDate(t, selectedDate))
                 .OrderBy(t => t.CompletedDates.Contains(selectedDate))
@@ -680,8 +683,9 @@ namespace DesktopCalendarWidget
                 {
                     if (enable)
                     {
-                        string? exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
-                        if (exePath != null) key.SetValue(appName, $"\"{exePath}\"");
+                        // 🔴 补全：优化程序路径获取，兼容独立打包发布（SingleFile）
+                        string exePath = Environment.ProcessPath ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DesktopCalendarWidget.exe");
+                        key.SetValue(appName, $"\"{exePath}\"");
                     }
                     else
                     {
