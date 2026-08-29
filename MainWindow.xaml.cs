@@ -116,8 +116,10 @@ namespace DesktopCalendarWidget
         }
 
         private List<TaskItemData> _allTasks = new List<TaskItemData>();
-        private readonly string _dataFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tasks.json");
-        private readonly string _settingsFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
+        
+        // 存储路径：存储到 %AppData%\DesktopCalendarWidget 文件夹下
+        private readonly string _dataFilePath;
+        private readonly string _settingsFilePath;
         
         private TaskItemData? _currentEditingTask = null;
         private AppSettingsData _currentSettings = new AppSettingsData();
@@ -125,6 +127,15 @@ namespace DesktopCalendarWidget
 
         public MainWindow()
         {
+            // 初始化数据与配置文件在 AppData 中的完整路径
+            string appDataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DesktopCalendarWidget");
+            if (!Directory.Exists(appDataFolder))
+            {
+                Directory.CreateDirectory(appDataFolder);
+            }
+            _dataFilePath = Path.Combine(appDataFolder, "tasks.json");
+            _settingsFilePath = Path.Combine(appDataFolder, "settings.json");
+
             InitializeComponent();
             this.SourceInitialized += MainWindow_SourceInitialized;
             LoadTasks();

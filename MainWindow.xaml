@@ -600,7 +600,7 @@
             </Grid>
 
             <!-- 抽屉：新建/编辑任务 -->
-            <Border x:Name="TaskEditDrawer" Background="#18181A" Panel.ZIndex="20" ClipToBounds="True" Margin="0,0,-1,0">
+            <Border x:Name="TaskEditDrawer" Background="#18181A" CornerRadius="16" Panel.ZIndex="20" ClipToBounds="True" Margin="0">
                 <Border.RenderTransform>
                     <TranslateTransform x:Name="TaskEditTransform" X="650"/>
                 </Border.RenderTransform>
@@ -675,7 +675,7 @@
             </Border>
 
             <!-- 抽屉：历史记录 -->
-            <Border x:Name="HistoryDrawer" Background="#18181A" Panel.ZIndex="20" ClipToBounds="True" Margin="0,0,-1,0">
+            <Border x:Name="HistoryDrawer" Background="#18181A" CornerRadius="16" Panel.ZIndex="20" ClipToBounds="True" Margin="0">
                 <Border.RenderTransform>
                     <TranslateTransform x:Name="HistoryTransform" X="650"/>
                 </Border.RenderTransform>
@@ -697,7 +697,7 @@
             </Border>
 
             <!-- 抽屉：软件设定 -->
-            <Border x:Name="SettingsDrawer" Background="#18181A" Panel.ZIndex="20" ClipToBounds="True" Margin="0,0,-1,0">
+            <Border x:Name="SettingsDrawer" Background="#18181A" CornerRadius="16" Panel.ZIndex="20" ClipToBounds="True" Margin="0">
                 <Border.RenderTransform>
                     <TranslateTransform x:Name="SettingsTransform" X="650"/>
                 </Border.RenderTransform>
