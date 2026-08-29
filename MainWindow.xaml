@@ -4,10 +4,13 @@
         xmlns:local="clr-namespace:DesktopCalendarWidget"
         Title="Desktop Widget" Height="320" Width="620"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
-        Topmost="False" ShowInTaskbar="False" MouseLeftButtonDown="Window_MouseLeftButtonDown">
+        Topmost="True" ShowInTaskbar="False" MouseLeftButtonDown="Window_MouseLeftButtonDown"
+        ResizeMode="NoResize"
         
+        >
+
     <Window.Resources>
-        <!-- 🔴 任务日历小蓝点转换器 -->
+        <!-- 任务日历小蓝点转换器 -->
         <local:TaskDayToVisibilityConverter x:Key="TaskDayToVisibilityConverter"/>
 
         <!-- 1. 消除焦点虚线框 -->
@@ -40,7 +43,7 @@
                                 <!-- 日期数字 -->
                                 <ContentPresenter Grid.Row="0" HorizontalAlignment="Center" VerticalAlignment="Center"/>
 
-                                <!-- 🔵 小蓝点指示器 (未完成任务时显示) -->
+                                <!-- 小蓝点指示器 (未完成任务时显示) -->
                                 <Ellipse Grid.Row="1" Width="4" Height="4" Fill="#60A5FA" Margin="0,2,0,0"
                                          HorizontalAlignment="Center"
                                          Visibility="{Binding Path=DataContext, RelativeSource={RelativeSource TemplatedParent}, Converter={StaticResource TaskDayToVisibilityConverter}}"/>

@@ -12,9 +12,24 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
+using System.Runtime.InteropServices;
+using System.Windows.Interop;
 
 namespace DesktopCalendarWidget
 {
+    public partial class MainWindow : Window
+    {
+        // Win32 API 用于修改窗口扩展样式
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_EX_TOOLWINDOW = 0x00000080; // 工具窗口样式（不出现在 Alt+Tab 列表中）
+    }
+    
     // 日期任务标记转换器：仅当指定日期有“未完成”任务时显示小蓝点
     public class TaskDayToVisibilityConverter : IValueConverter
     {
@@ -64,14 +79,23 @@ namespace DesktopCalendarWidget
         public MainWindow()
         {
             InitializeComponent();
+            // 在窗口初始化完成后挂载 SourceInitialized 事件
+            this.SourceInitialized += MainWindow_SourceInitialized;
             LoadTasks();
             LoadSettings();
 
-            // 🔴 补全：启动时根据已保存设置，自动同步注册表开机自启动状态
+            // 补全：启动时根据已保存设置，自动同步注册表开机自启动状态
             ApplyAutoStartRegistry(_currentSettings.IsAutoStartEnabled);
 
             InitEdgeHideTimer();
             MainCalendar.SelectedDate = DateTime.Today;
+        }
+        // 窗口句柄创建后，应用 WS_EX_TOOLWINDOW 样式
+        private void MainWindow_SourceInitialized(object? sender, EventArgs e)
+        {
+            var helper = new WindowInteropHelper(this);
+            int exStyle = GetWindowLong(helper.Handle, GWL_EXSTYLE);
+            SetWindowLong(helper.Handle, GWL_EXSTYLE, exStyle | WS_EX_TOOLWINDOW);
         }
 
         private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
