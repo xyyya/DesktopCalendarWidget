@@ -49,6 +49,52 @@ namespace DesktopCalendarWidget
         }
     }
 
+    // 悬浮窗 ToolTip 转换器：当鼠标移到日期上时，显示当天的任务详情
+    public class TaskDayToToolTipConverter : IValueConverter
+    {
+        public object? Convert(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (Application.Current.MainWindow is not MainWindow mainWin || value == null)
+                return null;
+
+            DateTime targetDate;
+
+            // 处理 WPF CalendarDayButton DataContext 的不同包装类型
+            if (value is DateTime dt)
+            {
+                targetDate = dt;
+            }
+            else if (DateTime.TryParse(value.ToString(), out DateTime parsedDate))
+            {
+                targetDate = parsedDate;
+            }
+            else
+            {
+                return null;
+            }
+
+            // 获取当天任务
+            var tasks = mainWin.GetTasksForDate(targetDate);
+            if (tasks != null && tasks.Any())
+            {
+                var lines = tasks.Select(t =>
+                {
+                    bool isCompleted = t.CompletedDates.Contains(targetDate.Date);
+                    string statusMark = isCompleted ? "[✓]" : "[ ]";
+                    return $"{statusMark} {t.Title}";
+                });
+                return $"{targetDate:yyyy-MM-dd} 任务:\n" + string.Join("\n", lines);
+            }
+
+            return null; // 无任务时不弹 ToolTip
+        }
+
+        public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            throw new NotImplementedException();
+        }
+    }
+
     public partial class MainWindow : Window
     {
         public class TaskItemData
@@ -66,6 +112,7 @@ namespace DesktopCalendarWidget
         {
             public bool IsEdgeHideEnabled { get; set; } = false;
             public bool IsAutoStartEnabled { get; set; } = false;
+            public double Opacity { get; set; } = 1.0; // 默认 100% 不透明度
         }
 
         private List<TaskItemData> _allTasks = new List<TaskItemData>();
@@ -79,18 +126,16 @@ namespace DesktopCalendarWidget
         public MainWindow()
         {
             InitializeComponent();
-            // 在窗口初始化完成后挂载 SourceInitialized 事件
             this.SourceInitialized += MainWindow_SourceInitialized;
             LoadTasks();
             LoadSettings();
 
-            // 补全：启动时根据已保存设置，自动同步注册表开机自启动状态
             ApplyAutoStartRegistry(_currentSettings.IsAutoStartEnabled);
 
             InitEdgeHideTimer();
             MainCalendar.SelectedDate = DateTime.Today;
         }
-        // 窗口句柄创建后，应用 WS_EX_TOOLWINDOW 样式
+        
         private void MainWindow_SourceInitialized(object? sender, EventArgs e)
         {
             var helper = new WindowInteropHelper(this);
@@ -106,14 +151,18 @@ namespace DesktopCalendarWidget
             }
         }
 
-        // 判断指定日期是否有未完成的任务
         public bool HasUnfinishedTaskOnDate(DateTime date)
         {
             DateTime pureDate = date.Date;
             return _allTasks.Any(task => IsTaskMatchDate(task, pureDate) && !task.CompletedDates.Contains(pureDate));
         }
 
-        // 刷新日历绘制（触发小蓝点转换器刷新）
+        public List<TaskItemData> GetTasksForDate(DateTime date)
+        {
+            DateTime pureDate = date.Date;
+            return _allTasks.Where(task => IsTaskMatchDate(task, pureDate)).ToList();
+        }
+
         private void RefreshCalendarView()
         {
             if (MainCalendar == null) return;
@@ -131,6 +180,10 @@ namespace DesktopCalendarWidget
 
             lblDrawerTitle.Text = isEditMode ? "修改任务" : "新建任务";
             txtTitle.Text = isEditMode ? taskToEdit!.Title : "新任务";
+            
+            // 默认日期取编辑任务的目标日期或当前选中的日历日期
+            dpTaskDate.SelectedDate = isEditMode ? taskToEdit!.TargetDate : (MainCalendar.SelectedDate ?? DateTime.Today);
+
             chkRecurring.IsChecked = isEditMode ? taskToEdit!.IsRecurring : false;
             txtInterval.Text = isEditMode ? taskToEdit!.RecurrenceInterval.ToString() : "1";
 
@@ -149,16 +202,16 @@ namespace DesktopCalendarWidget
                 cmbUnit.SelectedIndex = 0;
             }
 
-            AnimateDrawer(HistoryTransform, 600);
-            AnimateDrawer(SettingsTransform, 600);
+            AnimateDrawer(HistoryTransform, 650);
+            AnimateDrawer(SettingsTransform, 650);
             AnimateDrawer(TaskEditTransform, 0);
         }
 
         private void OpenHistoryDrawer()
         {
             RefreshHistoryList();
-            AnimateDrawer(TaskEditTransform, 600);
-            AnimateDrawer(SettingsTransform, 600);
+            AnimateDrawer(TaskEditTransform, 650);
+            AnimateDrawer(SettingsTransform, 650);
             AnimateDrawer(HistoryTransform, 0);
         }
 
@@ -166,17 +219,21 @@ namespace DesktopCalendarWidget
         {
             chkEdgeHide.IsChecked = _currentSettings.IsEdgeHideEnabled;
             chkAutoStart.IsChecked = _currentSettings.IsAutoStartEnabled;
+            if (sliderOpacity != null)
+            {
+                sliderOpacity.Value = _currentSettings.Opacity;
+            }
 
-            AnimateDrawer(TaskEditTransform, 600);
-            AnimateDrawer(HistoryTransform, 600);
+            AnimateDrawer(TaskEditTransform, 650);
+            AnimateDrawer(HistoryTransform, 650);
             AnimateDrawer(SettingsTransform, 0);
         }
 
         private void CloseDrawers_Click(object sender, RoutedEventArgs e)
         {
-            AnimateDrawer(TaskEditTransform, 600);
-            AnimateDrawer(HistoryTransform, 600);
-            AnimateDrawer(SettingsTransform, 600);
+            AnimateDrawer(TaskEditTransform, 650);
+            AnimateDrawer(HistoryTransform, 650);
+            AnimateDrawer(SettingsTransform, 650);
             _currentEditingTask = null;
         }
 
@@ -197,6 +254,47 @@ namespace DesktopCalendarWidget
             bool isChecked = chkRecurring.IsChecked ?? false;
             panelRecurring.IsEnabled = isChecked;
             panelRecurring.Opacity = isChecked ? 1.0 : 0.5;
+        }
+
+        #endregion
+
+        #region 快捷日期点击逻辑
+
+        private void SetToday_Click(object sender, RoutedEventArgs e)
+        {
+            dpTaskDate.SelectedDate = DateTime.Today;
+        }
+
+        private void SetTomorrow_Click(object sender, RoutedEventArgs e)
+        {
+            dpTaskDate.SelectedDate = DateTime.Today.AddDays(1);
+        }
+
+        private void SetNextWeek_Click(object sender, RoutedEventArgs e)
+        {
+            dpTaskDate.SelectedDate = DateTime.Today.AddDays(7);
+        }
+
+        private void SetNextMonth_Click(object sender, RoutedEventArgs e)
+        {
+            dpTaskDate.SelectedDate = DateTime.Today.AddMonths(1);
+        }
+
+        private void SetNextYear_Click(object sender, RoutedEventArgs e)
+        {
+            dpTaskDate.SelectedDate = DateTime.Today.AddYears(1);
+        }
+
+        private void SetNDaysLater_Click(object sender, RoutedEventArgs e)
+        {
+            if (int.TryParse(txtNDays.Text, out int days))
+            {
+                dpTaskDate.SelectedDate = DateTime.Today.AddDays(days);
+            }
+            else
+            {
+                MessageBox.Show("请输入有效的天数！", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
         }
 
         #endregion
@@ -232,9 +330,12 @@ namespace DesktopCalendarWidget
                 _ => "Day"
             };
 
+            DateTime selectedTargetDate = dpTaskDate.SelectedDate ?? DateTime.Today;
+
             if (_currentEditingTask != null)
             {
                 _currentEditingTask.Title = txtTitle.Text;
+                _currentEditingTask.TargetDate = selectedTargetDate;
                 _currentEditingTask.IsRecurring = chkRecurring.IsChecked ?? false;
                 _currentEditingTask.RecurrenceInterval = interval;
                 _currentEditingTask.RecurrenceUnit = unitStr;
@@ -244,16 +345,19 @@ namespace DesktopCalendarWidget
                 _allTasks.Add(new TaskItemData
                 {
                     Title = txtTitle.Text,
-                    TargetDate = MainCalendar.SelectedDate ?? DateTime.Today,
+                    TargetDate = selectedTargetDate,
                     IsRecurring = chkRecurring.IsChecked ?? false,
                     RecurrenceInterval = interval,
                     RecurrenceUnit = unitStr
                 });
             }
 
+            // 保存并同步自动将主日历的选中位置切到新建/修改任务的目标日期
+            MainCalendar.SelectedDate = selectedTargetDate;
+
             SaveTasks();
             RefreshTaskList();
-            RefreshCalendarView(); // 刷新日历小蓝点
+            RefreshCalendarView();
             CloseDrawers_Click(sender, e);
         }
 
@@ -274,7 +378,6 @@ namespace DesktopCalendarWidget
             Brush GetBrush(string hex) => (Brush?)new BrushConverter().ConvertFrom(hex) ?? Brushes.Gray;
             DateTime selectedDate = (MainCalendar.SelectedDate ?? DateTime.Today).Date;
 
-            // 🔵 打卡完成后自动沉底（按 未完成在上、已完成在下 排序）
             var matchedTasks = _allTasks
                 .Where(t => IsTaskMatchDate(t, selectedDate))
                 .OrderBy(t => t.CompletedDates.Contains(selectedDate))
@@ -338,7 +441,7 @@ namespace DesktopCalendarWidget
                     }
                     SaveTasks();
                     RefreshTaskList();
-                    RefreshCalendarView(); // 勾选/取消勾选后实时更新蓝点显隐
+                    RefreshCalendarView();
                 };
 
                 Grid.SetColumn(chkStatus, 0);
@@ -357,7 +460,7 @@ namespace DesktopCalendarWidget
                     _allTasks.Remove(task);
                     SaveTasks();
                     RefreshTaskList();
-                    RefreshCalendarView(); // 删除任务后实时更新蓝点显隐
+                    RefreshCalendarView();
                 };
 
                 contextMenu.Items.Add(menuEdit);
@@ -446,7 +549,7 @@ namespace DesktopCalendarWidget
                     SaveTasks();
                     RefreshHistoryList();
                     RefreshTaskList();
-                    RefreshCalendarView(); // 撤回历史打卡后自动刷新日历蓝点
+                    RefreshCalendarView();
                 };
 
                 Button btnDelete = new Button
@@ -466,7 +569,7 @@ namespace DesktopCalendarWidget
                     SaveTasks();
                     RefreshHistoryList();
                     RefreshTaskList();
-                    RefreshCalendarView(); // 删除任务后自动刷新日历蓝点
+                    RefreshCalendarView();
                 };
 
                 Grid.SetColumn(spInfo, 0);
@@ -659,6 +762,20 @@ namespace DesktopCalendarWidget
             SaveSettings();
             ApplyAutoStartRegistry(_currentSettings.IsAutoStartEnabled);
         }
+
+        private void SliderOpacity_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (!IsLoaded) return;
+
+            this.Opacity = e.NewValue;
+            if (txtOpacityValue != null)
+            {
+                txtOpacityValue.Text = $"{(int)(e.NewValue * 100)}%";
+            }
+
+            _currentSettings.Opacity = e.NewValue;
+            SaveSettings();
+        }
        
         private void ExitApp_Click(object sender, RoutedEventArgs e)
         {
@@ -695,6 +812,12 @@ namespace DesktopCalendarWidget
             {
                 _currentSettings = new AppSettingsData();
             }
+
+            if (_currentSettings.Opacity < 0.1 || _currentSettings.Opacity > 1.0)
+            {
+                _currentSettings.Opacity = 1.0;
+            }
+            this.Opacity = _currentSettings.Opacity;
         }
 
         private void ApplyAutoStartRegistry(bool enable)
@@ -707,7 +830,6 @@ namespace DesktopCalendarWidget
                 {
                     if (enable)
                     {
-                        // 🔴 补全：优化程序路径获取，兼容独立打包发布（SingleFile）
                         string exePath = Environment.ProcessPath ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DesktopCalendarWidget.exe");
                         key.SetValue(appName, $"\"{exePath}\"");
                     }
