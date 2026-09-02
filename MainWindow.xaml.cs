@@ -460,7 +460,7 @@ namespace DesktopCalendarWidget
                 _ = ToastNotificationManagerCompat.CreateToastNotifier();
 
                 new ToastContentBuilder()
-                    .AddText("💧 喝水提醒")
+                    .AddText("水精灵提醒您该喝水咯(∠・ω< )⌒★")
                     .AddText("为了您的健康，请及时补充水分！最好顺便起来走动走动！")
                     .Show();
             }
