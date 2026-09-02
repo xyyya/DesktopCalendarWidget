@@ -13,6 +13,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
+using System.Windows.Shapes;
 using System.Runtime.InteropServices;
 using System.Windows.Interop;
 using CommunityToolkit.WinUI.Notifications;
@@ -20,28 +21,33 @@ using CommunityToolkit.WinUI.Notifications;
 namespace DesktopCalendarWidget
 {
     // 日期任务标记转换器：返回 Brush 颜色（蓝点表示有未完成，绿点表示全完成）
-    public class TaskDayToBrushConverter : IValueConverter
+    public class TaskDayToBrushConverter : IValueConverter, IMultiValueConverter
     {
         public object Convert(object value, Type targetType, object parameter, CultureInfo culture)
         {
             if (value is DateTime date && Application.Current.MainWindow is MainWindow mainWin)
             {
-                var tasks = mainWin.GetTasksForDate(date).Where(t => t.ShowInCalendar).ToList();
-                if (tasks.Any())
+                // 绿色状态看“当天实际存在的全部任务”，不能先按 ShowInCalendar 过滤。
+                // 否则某个任务被设置为“不显示在日历”时，即使它未完成，也会让
+                // “当天所有任务完成”这个判断失真；更重要的是，循环任务完成后
+                // 需要参与这里的全完成判断。
+                var allTasksForDate = mainWin.GetTasksForDate(date).ToList();
+                if (allTasksForDate.Any())
                 {
-                    // 绿色：当天所有显示在日历中的任务都已完成。
-                    // 这里必须把循环任务也纳入“全完成”判断，否则“只有循环任务
-                    // 且当天已经完成”时不会显示绿点。
-                    bool allCompleted = tasks.All(t => t.CompletedDates.Contains(date.Date));
+                    bool allCompleted = allTasksForDate.All(t =>
+                        t.CompletedDates.Any(d => d.Date == date.Date));
+
                     if (allCompleted)
                     {
                         return new SolidColorBrush((Color)ColorConverter.ConvertFromString("#34D399"));
                     }
 
-                    // 蓝色：只针对未完成的非循环任务。
-                    // 循环任务即使当天未完成，也不显示蓝点。
-                    bool hasUncompletedNonRecurringTask = tasks.Any(t =>
-                        !t.IsRecurring && !t.CompletedDates.Contains(date.Date));
+                    // 蓝色仍然只显示“日历中可见的、未完成的普通任务”。
+                    // 循环任务无论是否完成，都不会单独触发蓝点。
+                    bool hasUncompletedNonRecurringTask = allTasksForDate
+                        .Where(t => t.ShowInCalendar)
+                        .Any(t => !t.IsRecurring &&
+                                  !t.CompletedDates.Any(d => d.Date == date.Date));
 
                     if (hasUncompletedNonRecurringTask)
                     {
@@ -53,6 +59,23 @@ namespace DesktopCalendarWidget
         }
 
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
+        {
+            throw new NotImplementedException();
+        }
+
+        // MultiBinding 版本：第二个值只是一个刷新令牌，用来确保任务完成状态
+        // 变化后，日历上的小点会重新计算，而不依赖 WPF 是否重建 CalendarDayButton。
+        public object Convert(object[] values, Type targetType, object parameter, CultureInfo culture)
+        {
+            if (values != null && values.Length > 0 && values[0] is DateTime date)
+            {
+                return Convert(date, targetType, parameter, culture);
+            }
+
+            return Brushes.Transparent;
+        }
+
+        public object[] ConvertBack(object value, Type[] targetTypes, object parameter, CultureInfo culture)
         {
             throw new NotImplementedException();
         }
@@ -104,6 +127,16 @@ namespace DesktopCalendarWidget
 
     public partial class MainWindow : Window
     {
+        // 每次任务状态发生变化时递增，用作日历小点的刷新触发器。
+        public static readonly DependencyProperty CalendarRefreshVersionProperty =
+            DependencyProperty.Register(nameof(CalendarRefreshVersion), typeof(int), typeof(MainWindow), new PropertyMetadata(0));
+
+        public int CalendarRefreshVersion
+        {
+            get => (int)GetValue(CalendarRefreshVersionProperty);
+            private set => SetValue(CalendarRefreshVersionProperty, value);
+        }
+
         // Win32 API 用于修改窗口扩展样式
         [DllImport("user32.dll")]
         private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
@@ -186,13 +219,13 @@ namespace DesktopCalendarWidget
                     $"Toast notification initialization failed: {ex}");
             }
 
-            string appDataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DesktopCalendarWidget");
+            string appDataFolder = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DesktopCalendarWidget");
             if (!Directory.Exists(appDataFolder))
             {
                 Directory.CreateDirectory(appDataFolder);
             }
-            _dataFilePath = Path.Combine(appDataFolder, "tasks.json");
-            _settingsFilePath = Path.Combine(appDataFolder, "settings.json");
+            _dataFilePath = System.IO.Path.Combine(appDataFolder, "tasks.json");
+            _settingsFilePath = System.IO.Path.Combine(appDataFolder, "settings.json");
 
             this.SourceInitialized += MainWindow_SourceInitialized;
             LoadTasks();
@@ -470,9 +503,38 @@ namespace DesktopCalendarWidget
         private void RefreshCalendarView()
         {
             if (MainCalendar == null) return;
+
+            // 让 Converter 重新计算。
+            CalendarRefreshVersion++;
+
             var current = MainCalendar.SelectedDate;
             MainCalendar.SelectedDate = null;
             MainCalendar.SelectedDate = current;
+
+            // WPF Calendar 的 CalendarDayButton 有时不会因为内部任务数据变化
+            // 自动重绘模板里的 MultiBinding，因此再主动刷新已经生成的 Ellipse。
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                MainCalendar.UpdateLayout();
+                RefreshCalendarDotBindings(MainCalendar);
+            }), DispatcherPriority.Loaded);
+        }
+
+        private static void RefreshCalendarDotBindings(DependencyObject parent)
+        {
+            int count = VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < count; i++)
+            {
+                var child = VisualTreeHelper.GetChild(parent, i);
+
+                if (child is Ellipse ellipse)
+                {
+                    var expression = BindingOperations.GetBindingExpressionBase(ellipse, Ellipse.FillProperty);
+                    expression?.UpdateTarget();
+                }
+
+                RefreshCalendarDotBindings(child);
+            }
         }
 
         #region 抽屉动画控制 (Drawer Animation)
@@ -1444,7 +1506,7 @@ namespace DesktopCalendarWidget
                 {
                     if (enable)
                     {
-                        string exePath = Environment.ProcessPath ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DesktopCalendarWidget.exe");
+                        string exePath = Environment.ProcessPath ?? System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "DesktopCalendarWidget.exe");
                         key.SetValue(appName, $"\"{exePath}\"");
                     }
                     else
