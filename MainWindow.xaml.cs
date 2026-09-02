@@ -1,9 +1,10 @@
-﻿using Microsoft.Win32;
+using Microsoft.Win32;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -14,22 +15,10 @@ using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using System.Runtime.InteropServices;
 using System.Windows.Interop;
+using Microsoft.Toolkit.Uwp.Notifications;
 
 namespace DesktopCalendarWidget
 {
-    public partial class MainWindow : Window
-    {
-        // Win32 API 用于修改窗口扩展样式
-        [DllImport("user32.dll")]
-        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-
-        [DllImport("user32.dll")]
-        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
-
-        private const int GWL_EXSTYLE = -20;
-        private const int WS_EX_TOOLWINDOW = 0x00000080; // 工具窗口样式（不出现在 Alt+Tab 列表中）
-    }
-    
     // 日期任务标记转换器：返回 Brush 颜色（蓝点表示有未完成，绿点表示全完成）
     public class TaskDayToBrushConverter : IValueConverter
     {
@@ -47,7 +36,7 @@ namespace DesktopCalendarWidget
                     }
                     else
                     {
-                        return new SolidColorBrush((Color)ColorConverter.ConvertFromString("#60A5FA")); // 蓝点：有未完成
+                        return mainWin.GetThemeBrush("AccentLightBrush"); // 蓝点：有未完成
                     }
                 }
             }
@@ -106,6 +95,17 @@ namespace DesktopCalendarWidget
 
     public partial class MainWindow : Window
     {
+        // Win32 API 用于修改窗口扩展样式
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        // Win32 窗口扩展样式常量
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+
         public class TaskDisplayModel
         {
             public TaskItemData Task { get; set; } = new TaskItemData();
@@ -131,14 +131,17 @@ namespace DesktopCalendarWidget
             public bool IsAutoStartEnabled { get; set; } = false;
             public double Opacity { get; set; } = 1.0;
             
-            // --- 新增：喝水提醒设定 ---
+            // 外观主题：System (跟随系统), Dark (深色), Light (浅色)
+            public string ThemeMode { get; set; } = "System";
+
+            // --- 喝水提醒设定 ---
             public bool IsWaterReminderEnabled { get; set; } = false;
             public int WaterTimesPerDay { get; set; } = 8;
             public string WaterStartTime { get; set; } = "09:00";
             public int WaterIntervalHours { get; set; } = 1;
             public int WaterIntervalMinutes { get; set; } = 0;
             
-            // 追踪状态（防止重启软件时狂弹提醒）
+            // 追踪状态
             public DateTime LastWaterReminderDate { get; set; } = DateTime.MinValue;
             public int WaterRemindersSentToday { get; set; } = 0;
         }
@@ -153,11 +156,14 @@ namespace DesktopCalendarWidget
         private DispatcherTimer? _edgeHideTimer;
         
         private DispatcherTimer? _midnightTimer;
-        private DispatcherTimer? _waterTimer; // 喝水提醒计时器
+        private DispatcherTimer? _waterTimer;
         private DateTime _lastCheckedDate = DateTime.Today;
 
         public MainWindow()
         {
+            // 初始化 UI 组件
+            InitializeComponent();
+
             string appDataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DesktopCalendarWidget");
             if (!Directory.Exists(appDataFolder))
             {
@@ -166,10 +172,14 @@ namespace DesktopCalendarWidget
             _dataFilePath = Path.Combine(appDataFolder, "tasks.json");
             _settingsFilePath = Path.Combine(appDataFolder, "settings.json");
 
-            InitializeComponent();
             this.SourceInitialized += MainWindow_SourceInitialized;
             LoadTasks();
             LoadSettings();
+
+            // 应用外观主题
+            ApplyTheme();
+            SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
+            this.Unloaded += (s, e) => SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
 
             ApplyAutoStartRegistry(_currentSettings.IsAutoStartEnabled);
 
@@ -177,9 +187,132 @@ namespace DesktopCalendarWidget
             MainCalendar.SelectedDate = DateTime.Today;
 
             InitMidnightTimer();
-            InitWaterTimer(); // 初始化喝水提醒
+            InitWaterTimer();
         }
-        
+
+        #region 外观主题（深色/浅色/跟随系统）处理逻辑
+
+        private void SystemEvents_UserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category == UserPreferenceCategory.General)
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    if (_currentSettings.ThemeMode == "System")
+                    {
+                        ApplyTheme();
+                    }
+                });
+            }
+        }
+
+        public void ApplyTheme()
+        {
+            string mode = _currentSettings.ThemeMode ?? "System";
+            bool isDark = true;
+
+            if (mode == "System")
+            {
+                isDark = IsSystemInDarkMode();
+            }
+            else if (mode == "Light")
+            {
+                isDark = false;
+            }
+            else
+            {
+                isDark = true;
+            }
+
+            SetThemeResources(isDark);
+            RefreshTaskList();
+            RefreshCalendarView();
+        }
+
+        private bool IsSystemInDarkMode()
+        {
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+                if (key != null)
+                {
+                    object? registryValue = key.GetValue("AppsUseLightTheme");
+                    if (registryValue != null)
+                    {
+                        return (int)registryValue == 0;
+                    }
+                }
+            }
+            catch { }
+            return true;
+        }
+
+        private void SetThemeResources(bool isDark)
+        {
+            if (isDark)
+            {
+                SetBrush("WindowBg", "#18181A");
+                SetBrush("CardBg", "#222226");
+                SetBrush("ControlBg", "#2D2D30");
+                SetBrush("ControlHoverBg", "#38383D");
+                SetBrush("DropDownBg", "#1E1E22");
+                SetBrush("BorderBrushKey", "#2D2D30");
+                SetBrush("SubBorderBrushKey", "#3F3F46");
+                SetBrush("TextPrimary", "#F0F0F0");
+                SetBrush("TextSecondary", "#A0A0A5");
+                SetBrush("TextMuted", "#71717A");
+                SetBrush("ThumbBg", "#3F3F46");
+                SetBrush("AccentBrush", "#2563EB");
+                SetBrush("AccentLightBrush", "#60A5FA");
+                SetBrush("CalendarHeaderBtnText", "#A0A0A5");
+            }
+            else
+            {
+                SetBrush("WindowBg", "#F3F4F6");
+                SetBrush("CardBg", "#FFFFFF");
+                SetBrush("ControlBg", "#E5E7EB");
+                SetBrush("ControlHoverBg", "#D1D5DB");
+                SetBrush("DropDownBg", "#FFFFFF");
+                SetBrush("BorderBrushKey", "#E5E7EB");
+                SetBrush("SubBorderBrushKey", "#D1D5DB");
+                SetBrush("TextPrimary", "#111827");
+                SetBrush("TextSecondary", "#4B5563");
+                SetBrush("TextMuted", "#9CA3AF");
+                SetBrush("ThumbBg", "#C1C1C1");
+                SetBrush("AccentBrush", "#2563EB");
+                SetBrush("AccentLightBrush", "#2563EB");
+                SetBrush("CalendarHeaderBtnText", "#4B5563");
+            }
+        }
+
+        private void SetBrush(string key, string hex)
+        {
+            var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hex));
+            brush.Freeze();
+            this.Resources[key] = brush;
+        }
+
+        public Brush GetThemeBrush(string key)
+        {
+            if (this.Resources.Contains(key) && this.Resources[key] is Brush brush)
+                return brush;
+            return Brushes.Gray;
+        }
+
+        private void CmbThemeMode_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!IsLoaded || cmbThemeMode.SelectedItem is not ComboBoxItem selectedItem) return;
+            string newTheme = selectedItem.Tag?.ToString() ?? "System";
+            if (_currentSettings.ThemeMode != newTheme)
+            {
+                _currentSettings.ThemeMode = newTheme;
+                SaveSettings();
+                ApplyTheme();
+            }
+        }
+
+        #endregion
+
         private void InitMidnightTimer()
         {
             _midnightTimer = new DispatcherTimer
@@ -227,7 +360,6 @@ namespace DesktopCalendarWidget
 
             DateTime now = DateTime.Now;
             
-            // 跨天重置状态
             if (_currentSettings.LastWaterReminderDate.Date != now.Date)
             {
                 _currentSettings.WaterRemindersSentToday = 0;
@@ -235,26 +367,22 @@ namespace DesktopCalendarWidget
                 SaveSettings();
             }
 
-            // 如果今天提醒次数已满，停止提醒
             if (_currentSettings.WaterRemindersSentToday >= _currentSettings.WaterTimesPerDay) return;
 
             if (!TimeSpan.TryParse(_currentSettings.WaterStartTime, out TimeSpan startTime))
                 startTime = new TimeSpan(9, 0, 0);
 
             TimeSpan interval = new TimeSpan(_currentSettings.WaterIntervalHours, _currentSettings.WaterIntervalMinutes, 0);
-            if (interval.TotalMinutes <= 0) return; // 避免间隔为0
+            if (interval.TotalMinutes <= 0) return;
 
-            // 计算【下一个】应当提醒的时间节点
             DateTime todayStart = now.Date.Add(startTime);
             DateTime expectedNext = todayStart.Add(TimeSpan.FromMinutes(interval.TotalMinutes * _currentSettings.WaterRemindersSentToday));
 
-            // 如果当前时间已经到达或超过了应提醒的时间
             if (now >= expectedNext)
             {
                 ShowWaterReminder();
                 _currentSettings.WaterRemindersSentToday++;
 
-                // 错过期间未打开软件的“快进”逻辑（避免软件一下午没开，晚上打开时一次性弹五六个窗口）
                 while (_currentSettings.WaterRemindersSentToday < _currentSettings.WaterTimesPerDay)
                 {
                     DateTime next = todayStart.Add(TimeSpan.FromMinutes(interval.TotalMinutes * _currentSettings.WaterRemindersSentToday));
@@ -269,8 +397,26 @@ namespace DesktopCalendarWidget
 
         private void ShowWaterReminder()
         {
-            // 你可以根据个人喜好更换这里的提示方式，目前使用MessageBox
-            MessageBox.Show("💧 该喝水啦！\n\n为了您的健康，请及时补充水分。", "喝水提醒", MessageBoxButton.OK, MessageBoxImage.Information);
+            try
+            {
+                ToastNotificationManagerCompat.CreateToastNotifier();
+
+                new ToastContentBuilder()
+                    .AddText("水精灵提醒你该喝水咯(∠・ω< )⌒★")
+                    .AddText("为了您的健康，请及时补充水分！最好顺便起来走动走动！")
+                    .Show();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"Windows 通知发送失败：\n\n{ex.Message}\n\n" +
+                    "请确认 Windows 通知功能已开启，并重新启动本程序。",
+                    "通知发送失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+
+                System.Diagnostics.Debug.WriteLine($"Toast notification failed: {ex}");
+            }
         }
 
         #endregion
@@ -357,6 +503,15 @@ namespace DesktopCalendarWidget
                 sliderOpacity.Value = _currentSettings.Opacity;
             }
             
+            // 绑定主题模式
+            string theme = _currentSettings.ThemeMode ?? "System";
+            cmbThemeMode.SelectedIndex = theme switch
+            {
+                "Dark" => 1,
+                "Light" => 2,
+                _ => 0
+            };
+
             // 绑定喝水设置项 UI
             chkWaterEnable.IsChecked = _currentSettings.IsWaterReminderEnabled;
             txtWaterTimes.Text = _currentSettings.WaterTimesPerDay.ToString();
@@ -616,13 +771,11 @@ namespace DesktopCalendarWidget
 
         private void AddTaskCategorySection(string categoryTitle, List<TaskDisplayModel> displayTasks, DateTime selectedDate, bool isExpandedByDefault, bool showDateLabel)
         {
-            Brush GetBrush(string hex) => (Brush?)new BrushConverter().ConvertFrom(hex) ?? Brushes.Gray;
-
             Expander categoryExpander = new Expander
             {
                 Header = $"{categoryTitle} ({displayTasks.Count})",
                 IsExpanded = isExpandedByDefault && displayTasks.Count > 0,
-                Foreground = GetBrush("#A0A0A5"),
+                Foreground = GetThemeBrush("TextSecondary"),
                 FontSize = 12,
                 FontWeight = FontWeights.Bold,
                 Margin = new Thickness(0, 0, 0, 8),
@@ -634,7 +787,7 @@ namespace DesktopCalendarWidget
                 categoryExpander.Content = new TextBlock
                 {
                     Text = "暂无任务",
-                    Foreground = GetBrush("#555558"),
+                    Foreground = GetThemeBrush("TextMuted"),
                     FontSize = 11,
                     Margin = new Thickness(8, 4, 0, 8)
                 };
@@ -652,7 +805,7 @@ namespace DesktopCalendarWidget
 
                 Border taskCard = new Border
                 {
-                    Background = GetBrush("#222226"),
+                    Background = GetThemeBrush("CardBg"),
                     CornerRadius = new CornerRadius(6),
                     Padding = new Thickness(8),
                     Margin = new Thickness(0, 0, 0, 6)
@@ -676,7 +829,7 @@ namespace DesktopCalendarWidget
                 TextBlock txtTitle = new TextBlock
                 {
                     Text = task.Title,
-                    Foreground = isCompleted ? GetBrush("#666666") : Brushes.White,
+                    Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextPrimary"),
                     FontWeight = FontWeights.Bold,
                     FontSize = 13,
                     TextDecorations = isCompleted ? TextDecorations.Strikethrough : null
@@ -688,7 +841,7 @@ namespace DesktopCalendarWidget
                     spText.Children.Add(new TextBlock
                     {
                         Text = $"🔁 每 {task.RecurrenceInterval} {task.RecurrenceUnit}",
-                        Foreground = isCompleted ? GetBrush("#444444") : GetBrush("#60A5FA"),
+                        Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("AccentLightBrush"),
                         FontSize = 11,
                         Margin = new Thickness(0, 2, 0, 0)
                     });
@@ -719,7 +872,7 @@ namespace DesktopCalendarWidget
                     TextBlock txtDateLabel = new TextBlock
                     {
                         Text = item.DisplayDate.ToString("M-d"),
-                        Foreground = isCompleted ? GetBrush("#555555") : GetBrush("#88888C"),
+                        Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextSecondary"),
                         FontSize = 11,
                         VerticalAlignment = VerticalAlignment.Center,
                         Margin = new Thickness(8, 0, 2, 0)
@@ -784,8 +937,6 @@ namespace DesktopCalendarWidget
             if (HistoryListPanel == null) return;
             HistoryListPanel.Children.Clear();
 
-            Brush GetBrush(string hex) => (Brush?)new BrushConverter().ConvertFrom(hex) ?? Brushes.Gray;
-
             var historyRecords = new List<(TaskItemData Task, DateTime Date)>();
             foreach (var task in _allTasks)
             {
@@ -802,7 +953,7 @@ namespace DesktopCalendarWidget
                 HistoryListPanel.Children.Add(new TextBlock
                 {
                     Text = "暂无打卡记录~",
-                    Foreground = Brushes.Gray,
+                    Foreground = GetThemeBrush("TextMuted"),
                     HorizontalAlignment = HorizontalAlignment.Center,
                     Margin = new Thickness(0, 30, 0, 0)
                 });
@@ -813,7 +964,7 @@ namespace DesktopCalendarWidget
             {
                 Border itemCard = new Border
                 {
-                    Background = GetBrush("#222226"),
+                    Background = GetThemeBrush("CardBg"),
                     CornerRadius = new CornerRadius(6),
                     Padding = new Thickness(8),
                     Margin = new Thickness(0, 0, 0, 8)
@@ -828,14 +979,14 @@ namespace DesktopCalendarWidget
                 spInfo.Children.Add(new TextBlock
                 {
                     Text = record.Task.Title,
-                    Foreground = Brushes.White,
+                    Foreground = GetThemeBrush("TextPrimary"),
                     FontWeight = FontWeights.Bold,
                     FontSize = 12
                 });
                 spInfo.Children.Add(new TextBlock
                 {
                     Text = $"📅 {record.Date:yyyy-MM-dd}",
-                    Foreground = GetBrush("#60A5FA"),
+                    Foreground = GetThemeBrush("AccentLightBrush"),
                     FontSize = 10,
                     Margin = new Thickness(0, 2, 0, 0)
                 });
@@ -843,7 +994,7 @@ namespace DesktopCalendarWidget
                 Button btnUndo = new Button
                 {
                     Content = "撤回",
-                    Background = GetBrush("#2563EB"),
+                    Background = GetThemeBrush("AccentBrush"),
                     Foreground = Brushes.White,
                     Padding = new Thickness(6, 2, 6, 2),
                     Margin = new Thickness(4, 0, 2, 0),
@@ -863,7 +1014,7 @@ namespace DesktopCalendarWidget
                 Button btnDelete = new Button
                 {
                     Content = "删除",
-                    Background = GetBrush("#DC2626"),
+                    Background = (Brush?)new BrushConverter().ConvertFrom("#DC2626") ?? Brushes.Red,
                     Foreground = Brushes.White,
                     Padding = new Thickness(6, 2, 6, 2),
                     Margin = new Thickness(2, 0, 0, 0),
@@ -901,10 +1052,10 @@ namespace DesktopCalendarWidget
         private DockEdge _currentDockEdge = DockEdge.None;
         private bool _isHiding = false;
 
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [DllImport("user32.dll")]
         private static extern bool GetCursorPos(out POINT lpPoint);
 
-        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        [StructLayout(LayoutKind.Sequential)]
         private struct POINT
         {
             public int X;
@@ -1071,7 +1222,6 @@ namespace DesktopCalendarWidget
             ApplyAutoStartRegistry(_currentSettings.IsAutoStartEnabled);
         }
         
-        // 喝水设定的开关逻辑
         private void WaterSetting_Changed(object sender, RoutedEventArgs e)
         {
             if (!IsLoaded) return;
@@ -1087,7 +1237,6 @@ namespace DesktopCalendarWidget
             SaveSettings();
         }
 
-        // 保存一般喝水配置
         private void WaterSetting_LostFocus(object sender, RoutedEventArgs e)
         {
             if (!IsLoaded) return;
@@ -1112,7 +1261,6 @@ namespace DesktopCalendarWidget
             SaveSettings();
         }
         
-        // 进位逻辑核心：间隔分钟数双格逻辑处理
         private void WaterInterval_LostFocus(object sender, RoutedEventArgs e)
         {
             if (!IsLoaded) return;
@@ -1120,21 +1268,18 @@ namespace DesktopCalendarWidget
             int.TryParse(txtWaterHour.Text, out int hours);
             int.TryParse(txtWaterMin.Text, out int mins);
             
-            // 超过 60 分钟自动进位
             if (mins >= 60)
             {
                 hours += mins / 60;
                 mins = mins % 60;
             }
             
-            // 防止负数
             if (mins < 0) mins = 0;
             if (hours < 0) hours = 0;
             
             txtWaterHour.Text = hours.ToString();
             txtWaterMin.Text = mins.ToString();
             
-            // 触发上面的常规保存逻辑
             WaterSetting_LostFocus(sender, e);
         }
 
