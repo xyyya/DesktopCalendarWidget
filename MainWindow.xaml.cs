@@ -15,7 +15,7 @@ using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using System.Runtime.InteropServices;
 using System.Windows.Interop;
-using Microsoft.Toolkit.Uwp.Notifications;
+using CommunityToolkit.WinUI.Notifications;
 
 namespace DesktopCalendarWidget
 {
@@ -29,14 +29,23 @@ namespace DesktopCalendarWidget
                 var tasks = mainWin.GetTasksForDate(date).Where(t => t.ShowInCalendar).ToList();
                 if (tasks.Any())
                 {
+                    // 绿色：当天所有显示在日历中的任务都已完成。
+                    // 这里必须把循环任务也纳入“全完成”判断，否则“只有循环任务
+                    // 且当天已经完成”时不会显示绿点。
                     bool allCompleted = tasks.All(t => t.CompletedDates.Contains(date.Date));
                     if (allCompleted)
                     {
-                        return new SolidColorBrush((Color)ColorConverter.ConvertFromString("#34D399")); // 绿点：全完成
+                        return new SolidColorBrush((Color)ColorConverter.ConvertFromString("#34D399"));
                     }
-                    else
+
+                    // 蓝色：只针对未完成的非循环任务。
+                    // 循环任务即使当天未完成，也不显示蓝点。
+                    bool hasUncompletedNonRecurringTask = tasks.Any(t =>
+                        !t.IsRecurring && !t.CompletedDates.Contains(date.Date));
+
+                    if (hasUncompletedNonRecurringTask)
                     {
-                        return mainWin.GetThemeBrush("AccentLightBrush"); // 蓝点：有未完成
+                        return mainWin.GetThemeBrush("AccentLightBrush");
                     }
                 }
             }
@@ -163,6 +172,19 @@ namespace DesktopCalendarWidget
         {
             // 初始化 UI 组件
             InitializeComponent();
+
+            // 主动初始化 CommunityToolkit 的 Toast Compat。
+            // 这样程序启动后就会完成未打包 WPF 通知所需的注册，
+            // 不再依赖手工创建 AUMID 快捷方式。
+            try
+            {
+                _ = ToastNotificationManagerCompat.CreateToastNotifier();
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"Toast notification initialization failed: {ex}");
+            }
 
             string appDataFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DesktopCalendarWidget");
             if (!Directory.Exists(appDataFolder))
@@ -399,10 +421,13 @@ namespace DesktopCalendarWidget
         {
             try
             {
-                ToastNotificationManagerCompat.CreateToastNotifier();
+                // CommunityToolkit 的 ToastNotificationManagerCompat 会为未打包的 WPF
+                // 应用自动完成通知所需的注册，不需要手动创建 AUMID 快捷方式。
+                // 先显式创建 Compat notifier，确保注册已经完成。
+                _ = ToastNotificationManagerCompat.CreateToastNotifier();
 
                 new ToastContentBuilder()
-                    .AddText("水精灵提醒你该喝水咯(∠・ω< )⌒★")
+                    .AddText("💧 喝水提醒")
                     .AddText("为了您的健康，请及时补充水分！最好顺便起来走动走动！")
                     .Show();
             }
