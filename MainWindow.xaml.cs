@@ -231,6 +231,13 @@ namespace DesktopCalendarWidget
             LoadTasks();
             LoadSettings();
 
+            // 启动时同步“开机自动启动”复选框状态。
+            // 否则注册表启动成功后，重启程序时 UI 仍可能显示为未勾选。
+            if (chkAutoStart != null)
+            {
+                chkAutoStart.IsChecked = _currentSettings.IsAutoStartEnabled;
+            }
+
             // 应用外观主题
             ApplyTheme();
             SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
@@ -460,7 +467,7 @@ namespace DesktopCalendarWidget
                 _ = ToastNotificationManagerCompat.CreateToastNotifier();
 
                 new ToastContentBuilder()
-                    .AddText("水精灵提醒您该喝水咯(∠・ω< )⌒★")
+                    .AddText("💧 喝水提醒")
                     .AddText("为了您的健康，请及时补充水分！最好顺便起来走动走动！")
                     .Show();
             }
@@ -954,18 +961,73 @@ namespace DesktopCalendarWidget
                 cardGrid.Children.Add(chkStatus);
                 cardGrid.Children.Add(spText);
 
-                if (showDateLabel)
+                // 循环任务的统计统一放在任务卡片最右侧。
+                // 未来/过去任务：日期在上，统计在日期下方；
+                // 今日任务：没有日期标签，但统计仍保持在最右侧。
+                if (showDateLabel || task.IsRecurring)
                 {
-                    TextBlock txtDateLabel = new TextBlock
+                    StackPanel dateInfoPanel = new StackPanel
                     {
-                        Text = item.DisplayDate.ToString("M-d"),
-                        Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextSecondary"),
-                        FontSize = 11,
-                        VerticalAlignment = VerticalAlignment.Center,
+                        Orientation = Orientation.Vertical,
+                        VerticalAlignment = VerticalAlignment.Top,
+                        HorizontalAlignment = HorizontalAlignment.Right,
                         Margin = new Thickness(8, 0, 2, 0)
                     };
-                    Grid.SetColumn(txtDateLabel, 2);
-                    cardGrid.Children.Add(txtDateLabel);
+
+                    if (showDateLabel)
+                    {
+                        TextBlock txtDateLabel = new TextBlock
+                        {
+                            Text = item.DisplayDate.ToString("M-d"),
+                            Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextSecondary"),
+                            FontSize = 11,
+                            VerticalAlignment = VerticalAlignment.Top,
+                            HorizontalAlignment = HorizontalAlignment.Right,
+                            Margin = new Thickness(0, -1, 0, 0)
+                        };
+                        dateInfoPanel.Children.Add(txtDateLabel);
+                    }
+
+                    if (task.IsRecurring)
+                    {
+                        (int totalCompleted, int currentStreak, int longestStreak) = GetRecurringCompletionStats(task);
+
+                        TextBlock txtTotalStats = new TextBlock
+                        {
+                            Text = $"已完成{totalCompleted}次",
+                            Foreground = GetThemeBrush("TextMuted"),
+                            FontSize = 9,
+                            HorizontalAlignment = HorizontalAlignment.Right,
+                            TextAlignment = TextAlignment.Right,
+                            Margin = new Thickness(0, showDateLabel ? 1 : 0, 0, 0)
+                        };
+                        dateInfoPanel.Children.Add(txtTotalStats);
+
+                        TextBlock txtCurrentStreak = new TextBlock
+                        {
+                            Text = $"连续完成{currentStreak}次",
+                            Foreground = GetThemeBrush("TextMuted"),
+                            FontSize = 9,
+                            HorizontalAlignment = HorizontalAlignment.Right,
+                            TextAlignment = TextAlignment.Right,
+                            Margin = new Thickness(0, 0, 0, 0)
+                        };
+                        dateInfoPanel.Children.Add(txtCurrentStreak);
+
+                        TextBlock txtLongestStreak = new TextBlock
+                        {
+                            Text = $"最长连续完成{longestStreak}次",
+                            Foreground = GetThemeBrush("TextMuted"),
+                            FontSize = 9,
+                            HorizontalAlignment = HorizontalAlignment.Right,
+                            TextAlignment = TextAlignment.Right,
+                            Margin = new Thickness(0, 0, 0, 0)
+                        };
+                        dateInfoPanel.Children.Add(txtLongestStreak);
+                    }
+
+                    Grid.SetColumn(dateInfoPanel, 2);
+                    cardGrid.Children.Add(dateInfoPanel);
                 }
 
                 taskCard.Child = cardGrid;
@@ -1395,6 +1457,149 @@ namespace DesktopCalendarWidget
         #endregion
 
         #region 数据与周期计算逻辑
+
+        // 判断某一天是否是循环任务的“计划日”，不考虑“仅删除本日”。
+        // 连续完成统计必须把被删除的本日视为一次断档。
+        private bool IsTaskScheduledDate(TaskItemData task, DateTime queryDate)
+        {
+            DateTime pureDate = queryDate.Date;
+
+            if (!task.IsRecurring)
+            {
+                return task.TargetDate.Date == pureDate;
+            }
+
+            if (pureDate < task.TargetDate.Date)
+            {
+                return false;
+            }
+
+            TimeSpan diff = pureDate - task.TargetDate.Date;
+            int interval = Math.Max(1, task.RecurrenceInterval);
+
+            switch (task.RecurrenceUnit)
+            {
+                case "Day":
+                    return diff.Days % interval == 0;
+                case "Week":
+                    return diff.Days % 7 == 0 && (diff.Days / 7) % interval == 0;
+                case "Month":
+                    int monthDiff = (pureDate.Year - task.TargetDate.Year) * 12 +
+                                    (pureDate.Month - task.TargetDate.Month);
+                    return monthDiff >= 0 && monthDiff % interval == 0 &&
+                           pureDate.Day == task.TargetDate.Day;
+                case "Year":
+                    int yearDiff = pureDate.Year - task.TargetDate.Year;
+                    return yearDiff >= 0 && yearDiff % interval == 0 &&
+                           pureDate.Month == task.TargetDate.Month &&
+                           pureDate.Day == task.TargetDate.Day;
+                default:
+                    return false;
+            }
+        }
+
+        // 返回：累计完成次数、当前连续完成次数、历史最长连续完成次数。
+        // “仅删除本日”会打断连续次数，例如：1、2 完成，3 删除，4 完成 => 当前连续完成 1 次。
+        private (int totalCompleted, int currentStreak, int longestStreak) GetRecurringCompletionStats(TaskItemData task)
+        {
+            if (!task.IsRecurring || task.CompletedDates == null || task.CompletedDates.Count == 0)
+            {
+                return (0, 0, 0);
+            }
+
+            var completedDates = task.CompletedDates
+                .Select(d => d.Date)
+                .Where(d => IsTaskScheduledDate(task, d) &&
+                            (task.SkippedDates == null || !task.SkippedDates.Contains(d)))
+                .Distinct()
+                .OrderBy(d => d)
+                .ToList();
+
+            if (completedDates.Count == 0)
+            {
+                return (0, 0, 0);
+            }
+
+            // 连续性按“下一次计划日期”判断，而不是简单按自然日判断，
+            // 因此每周/每月等循环也能正确计算。SkippedDates 会明确打断连续。
+            int longestStreak = 1;
+            int run = 1;
+
+            for (int i = 1; i < completedDates.Count; i++)
+            {
+                DateTime previous = completedDates[i - 1];
+                DateTime current = completedDates[i];
+                DateTime expectedNext = GetNextScheduledDate(task, previous);
+
+                bool skippedBetween = HasSkippedScheduledDate(task, previous, current);
+                if (current == expectedNext && !skippedBetween)
+                {
+                    run++;
+                }
+                else
+                {
+                    run = 1;
+                }
+
+                if (run > longestStreak)
+                {
+                    longestStreak = run;
+                }
+            }
+
+            // 当前连续次数：从最近一次完成往前追溯。
+            int currentStreak = 1;
+            for (int i = completedDates.Count - 1; i > 0; i--)
+            {
+                DateTime previous = completedDates[i - 1];
+                DateTime current = completedDates[i];
+                DateTime expectedNext = GetNextScheduledDate(task, previous);
+
+                if (current == expectedNext && !HasSkippedScheduledDate(task, previous, current))
+                {
+                    currentStreak++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            return (completedDates.Count, currentStreak, longestStreak);
+        }
+
+        private DateTime GetNextScheduledDate(TaskItemData task, DateTime date)
+        {
+            int interval = Math.Max(1, task.RecurrenceInterval);
+
+            switch (task.RecurrenceUnit)
+            {
+                case "Day":
+                    return date.AddDays(interval);
+                case "Week":
+                    return date.AddDays(7 * interval);
+                case "Month":
+                    return date.AddMonths(interval);
+                case "Year":
+                    return date.AddYears(interval);
+                default:
+                    return date.AddDays(interval);
+            }
+        }
+
+        private bool HasSkippedScheduledDate(TaskItemData task, DateTime fromExclusive, DateTime toExclusive)
+        {
+            if (task.SkippedDates == null || task.SkippedDates.Count == 0)
+                return false;
+
+            for (DateTime d = fromExclusive.Date.AddDays(1); d < toExclusive.Date; d = d.AddDays(1))
+            {
+                if (IsTaskScheduledDate(task, d) && task.SkippedDates.Contains(d.Date))
+                    return true;
+            }
+
+            return false;
+        }
 
         private bool IsTaskMatchDate(TaskItemData task, DateTime queryDate)
         {
