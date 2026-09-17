@@ -23,3 +23,16 @@
 有意见或问题可提交issue，看到了有空就改
 
 也欢迎高人拿去改（）
+
+## 🌐 Language / 语言
+
+The application now supports two UI languages:
+
+- 简体中文 (Simplified Chinese)
+- English
+
+Open **Settings → Language** to switch. The choice is saved in `settings.json` and will be restored on the next launch. Existing task, group, and note data is not translated or modified.
+
+### Build bilingual Windows release
+
+Run `Build-Bilingual-Release.bat` on a Windows machine with the .NET 8 SDK installed. It publishes a self-contained `win-x64` single-file executable into the `publish` folder.

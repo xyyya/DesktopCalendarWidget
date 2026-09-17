@@ -6,8 +6,10 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -15,6 +17,7 @@ using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using System.Windows.Shapes;
 using System.Runtime.InteropServices;
+using System.ComponentModel;
 using System.Windows.Interop;
 using CommunityToolkit.WinUI.Notifications;
 
@@ -113,7 +116,7 @@ namespace DesktopCalendarWidget
                     string statusMark = isCompleted ? "[✓]" : "[ ]";
                     return $"{statusMark} {t.Title}";
                 });
-                return $"{targetDate:yyyy-MM-dd} 任务:\n" + string.Join("\n", lines);
+                return $"{targetDate:yyyy-MM-dd} {Localization.T("任务:")}\n" + string.Join("\n", lines);
             }
 
             return null;
@@ -125,7 +128,7 @@ namespace DesktopCalendarWidget
         }
     }
 
-    public partial class MainWindow : Window
+    public partial class MainWindow : Window, INotifyPropertyChanged
     {
         // 每次任务状态发生变化时递增，用作日历小点的刷新触发器。
         public static readonly DependencyProperty CalendarRefreshVersionProperty =
@@ -165,6 +168,31 @@ namespace DesktopCalendarWidget
             public bool ShowInCalendar { get; set; } = true;
             public HashSet<DateTime> CompletedDates { get; set; } = new HashSet<DateTime>();
             public HashSet<DateTime> SkippedDates { get; set; } = new HashSet<DateTime>();
+            // 新版层级分组：为空表示未分组；支持无限层级。
+            public string? GroupId { get; set; }
+        }
+
+        public class TaskGroupData
+        {
+            public string Id { get; set; } = Guid.NewGuid().ToString();
+            public string Name { get; set; } = "新分组";
+            public string? ParentGroupId { get; set; }
+        }
+
+        public class NoteData
+        {
+            public string Id { get; set; } = Guid.NewGuid().ToString();
+            public string Title { get; set; } = "新便签";
+            public string Content { get; set; } = string.Empty;
+            // 为空 = 独立便签；有值 = Task 专属便签。
+            public string? TaskId { get; set; }
+            public bool IsCompleted { get; set; }
+            public DateTime CreatedAt { get; set; } = DateTime.Now;
+            public DateTime UpdatedAt { get; set; } = DateTime.Now;
+            public double? WindowLeft { get; set; }
+            public double? WindowTop { get; set; }
+            public double FontSize { get; set; } = 13;
+            public string FontColor { get; set; } = "#FFFFFFFF";
         }
 
         public class AppSettingsData
@@ -175,6 +203,9 @@ namespace DesktopCalendarWidget
             
             // 外观主题：System (跟随系统), Dark (深色), Light (浅色)
             public string ThemeMode { get; set; } = "System";
+
+            // 界面语言：zh-CN / en-US
+            public string Language { get; set; } = "en-US";
 
             // --- 喝水提醒设定 ---
             public bool IsWaterReminderEnabled { get; set; } = false;
@@ -189,8 +220,19 @@ namespace DesktopCalendarWidget
         }
 
         private List<TaskItemData> _allTasks = new List<TaskItemData>();
+        private List<TaskGroupData> _allGroups = new List<TaskGroupData>();
+        private List<NoteData> _allNotes = new List<NoteData>();
+
+        public IReadOnlyList<TaskItemData> AllTasksForNotes => _allTasks;
+
+        private TaskGroupData? _currentEditingGroup;
+        private NoteData? _currentEditingNote;
+        private readonly List<NoteWindow> _openNoteWindows = new List<NoteWindow>();
+        private readonly List<CheckBox> _groupTaskChecks = new List<CheckBox>();
         
         private readonly string _dataFilePath;
+        private readonly string _groupsFilePath;
+        private readonly string _notesFilePath;
         private readonly string _settingsFilePath;
         
         private TaskItemData? _currentEditingTask = null;
@@ -200,11 +242,55 @@ namespace DesktopCalendarWidget
         private DispatcherTimer? _midnightTimer;
         private DispatcherTimer? _waterTimer;
         private DateTime _lastCheckedDate = DateTime.Today;
+        private bool _isApplyingLanguage;
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        public string CalendarHeaderText
+        {
+            get
+            {
+                DateTime date = MainCalendar?.DisplayDate ?? DateTime.Today;
+                CalendarMode mode = MainCalendar?.DisplayMode ?? CalendarMode.Month;
+
+                if (mode == CalendarMode.Year)
+                    return Localization.IsEnglish ? date.Year.ToString() : $"{date.Year}年";
+
+                if (mode == CalendarMode.Decade)
+                {
+                    int decadeStart = (date.Year / 10) * 10;
+                    return Localization.IsEnglish ? $"{decadeStart}s" : $"{decadeStart}年代";
+                }
+
+                if (!Localization.IsEnglish)
+                    return $"{date.Year}年{date.Month}月";
+
+                string[] monthNames =
+                {
+                    "January", "February", "March", "April", "May", "June",
+                    "July", "August", "September", "October", "November", "December"
+                };
+                return $"{monthNames[date.Month - 1]} {date.Year}";
+            }
+        }
+
+        private void RaisePropertyChanged(string propertyName)
+            => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 
         public MainWindow()
         {
             // 初始化 UI 组件
             InitializeComponent();
+            MainCalendar.DisplayDateChanged += (s, e) =>
+            {
+                RaisePropertyChanged(nameof(CalendarHeaderText));
+                Dispatcher.BeginInvoke(new Action(RefreshCalendarLanguage), DispatcherPriority.Loaded);
+            };
+            MainCalendar.DisplayModeChanged += (s, e) =>
+            {
+                RaisePropertyChanged(nameof(CalendarHeaderText));
+                Dispatcher.BeginInvoke(new Action(RefreshCalendarLanguage), DispatcherPriority.Loaded);
+            };
 
             // 主动初始化 CommunityToolkit 的 Toast Compat。
             // 这样程序启动后就会完成未打包 WPF 通知所需的注册，
@@ -225,10 +311,14 @@ namespace DesktopCalendarWidget
                 Directory.CreateDirectory(appDataFolder);
             }
             _dataFilePath = System.IO.Path.Combine(appDataFolder, "tasks.json");
+            _groupsFilePath = System.IO.Path.Combine(appDataFolder, "groups.json");
+            _notesFilePath = System.IO.Path.Combine(appDataFolder, "notes.json");
             _settingsFilePath = System.IO.Path.Combine(appDataFolder, "settings.json");
 
             this.SourceInitialized += MainWindow_SourceInitialized;
             LoadTasks();
+            LoadGroups();
+            LoadNotes();
             LoadSettings();
 
             // 启动时同步“开机自动启动”复选框状态。
@@ -238,18 +328,32 @@ namespace DesktopCalendarWidget
                 chkAutoStart.IsChecked = _currentSettings.IsAutoStartEnabled;
             }
 
-            // 应用外观主题
+            // 应用外观主题与界面语言
+            Localization.SetLanguage(_currentSettings.Language);
             ApplyTheme();
+            ApplyLanguage();
             SystemEvents.UserPreferenceChanged += SystemEvents_UserPreferenceChanged;
             this.Unloaded += (s, e) => SystemEvents.UserPreferenceChanged -= SystemEvents_UserPreferenceChanged;
 
             ApplyAutoStartRegistry(_currentSettings.IsAutoStartEnabled);
 
-            InitEdgeHideTimer();
             MainCalendar.SelectedDate = DateTime.Today;
 
             InitMidnightTimer();
             InitWaterTimer();
+
+            // 等窗口真正显示后再启动贴边隐藏计时器，避免启动瞬间把窗口
+            // 判定为“贴边”并直接藏到屏幕外。
+            this.ContentRendered += MainWindow_ContentRendered;
+        }
+
+        private void MainWindow_ContentRendered(object? sender, EventArgs e)
+        {
+            ContentRendered -= MainWindow_ContentRendered;
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                InitEdgeHideTimer();
+            }), DispatcherPriority.ApplicationIdle);
         }
 
         #region 外观主题（深色/浅色/跟随系统）处理逻辑
@@ -289,6 +393,10 @@ namespace DesktopCalendarWidget
             SetThemeResources(isDark);
             RefreshTaskList();
             RefreshCalendarView();
+            foreach (Window window in Application.Current.Windows)
+            {
+                if (window is NoteWindow noteWindow) noteWindow.ApplyTheme();
+            }
         }
 
         private bool IsSystemInDarkMode()
@@ -370,6 +478,148 @@ namespace DesktopCalendarWidget
                 _currentSettings.ThemeMode = newTheme;
                 SaveSettings();
                 ApplyTheme();
+            }
+        }
+
+        private void CmbLanguage_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_isApplyingLanguage || !IsLoaded || cmbLanguage == null) return;
+
+            // The language selector uses fixed native names. Selection is determined only
+            // by index, so generic UI localization can never alter its visible text.
+            string newLanguage = cmbLanguage.SelectedIndex == 1 ? "en-US" : "zh-CN";
+            if (string.Equals(_currentSettings.Language, newLanguage, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            _currentSettings.Language = newLanguage;
+            Localization.SetLanguage(newLanguage);
+            SaveSettings();
+            ApplyLanguage();
+        }
+
+        private static string NormalizeLanguageCode(string? language)
+        {
+            if (string.Equals(language, "en-US", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(language, "English", StringComparison.OrdinalIgnoreCase))
+                return "en-US";
+
+            if (string.Equals(language, "zh-CN", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(language, "简体中文", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(language, "Simplified Chinese", StringComparison.OrdinalIgnoreCase))
+                return "zh-CN";
+
+            return "en-US";
+        }
+
+        private void ApplyLanguage()
+        {
+            _isApplyingLanguage = true;
+            try
+            {
+                _currentSettings.Language = NormalizeLanguageCode(_currentSettings.Language);
+                Localization.SetLanguage(_currentSettings.Language);
+                Localization.ApplyWpfLanguage(this);
+
+                // Refresh the calendar header immediately whenever the language changes.
+                RaisePropertyChanged(nameof(CalendarHeaderText));
+
+                Localization.ApplyToVisualTree(this);
+
+                // The language label is a normal UI label and follows the selected UI language.
+                if (lblLanguage != null)
+                    lblLanguage.Text = Localization.T("界面语言");
+
+                // Language selector is intentionally excluded from generic localization.
+                // Keep both native language names and select by index only.
+                if (cmbLanguage != null)
+                {
+                    if (cmbLanguage.Items.Count >= 2)
+                    {
+                        if (cmbLanguage.Items[0] is ComboBoxItem zh) { zh.Content = "简体中文"; zh.Tag = "zh-CN"; }
+                        if (cmbLanguage.Items[1] is ComboBoxItem en) { en.Content = "English"; en.Tag = "en-US"; }
+                    }
+                    cmbLanguage.SelectedIndex = Localization.IsEnglish ? 1 : 0;
+                }
+
+            if (cmbThemeMode != null)
+            {
+                if (cmbThemeMode.Items.Count >= 3)
+                {
+                    if (cmbThemeMode.Items[0] is ComboBoxItem system) system.Content = Localization.IsEnglish ? "Follow System" : "跟随系统";
+                    if (cmbThemeMode.Items[1] is ComboBoxItem dark) dark.Content = Localization.IsEnglish ? "Dark" : "深色模式";
+                    if (cmbThemeMode.Items[2] is ComboBoxItem light) light.Content = Localization.IsEnglish ? "Light" : "浅色模式";
+                }
+            }
+            if (chkEdgeHide != null) chkEdgeHide.Content = Localization.T("贴边隐藏");
+            if (chkAutoStart != null) chkAutoStart.Content = Localization.T("开机自动启动");
+            if (chkWaterEnable != null) chkWaterEnable.Content = Localization.T("开启喝水提醒");
+            if (chkRecurring != null) chkRecurring.Content = Localization.T("开启循环提醒");
+            if (chkShowInCalendar != null) chkShowInCalendar.Content = Localization.T("在日历中提示小蓝点");
+            if (lblDrawerTitle != null) lblDrawerTitle.Text = Localization.T(lblDrawerTitle.Text == "修改任务" || lblDrawerTitle.Text == "Edit Task" ? "修改任务" : "新建任务");
+            if (lblGroupDrawerTitle != null) lblGroupDrawerTitle.Text = Localization.T(lblGroupDrawerTitle.Text == "编辑分组" || lblGroupDrawerTitle.Text == "Edit Group" ? "编辑分组" : "新建分组");
+
+            // 自定义周标题使用 DynamicResource，语言切换时会即时刷新。
+            string[] weekHeaders = Localization.IsEnglish
+                ? new[] { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
+                : new[] { "日", "一", "二", "三", "四", "五", "六" };
+            for (int i = 0; i < weekHeaders.Length; i++)
+                Resources[$"WeekHeader{i}"] = weekHeaders[i];
+
+            string[] recurrenceLabels = Localization.IsEnglish
+                ? new[] { "Day", "Week", "Month", "Year" }
+                : new[] { "天", "周", "月", "年" };
+            for (int i = 0; i < Math.Min(4, cmbUnit.Items.Count); i++)
+            {
+                if (cmbUnit.Items[i] is ComboBoxItem item)
+                    item.Content = recurrenceLabels[i];
+            }
+
+            // WPF Calendar 的标题位于 CalendarItem ControlTemplate 内，
+            // 每次语言/月份/显示模式变化都直接刷新模板里的可见 TextBlock。
+            RefreshCalendarLanguage();
+
+            lblWaterHourUnit.Text = Localization.IsEnglish ? " h " : " 时 ";
+            lblWaterMinuteUnit.Text = Localization.IsEnglish ? " m " : " 分 ";
+
+            // Translate UI defaults only; never alter user-entered task/group names.
+            if (txtTitle != null && (txtTitle.Text == "新任务" || txtTitle.Text == "New Task"))
+                txtTitle.Text = Localization.T("新任务");
+            if (txtGroupName != null && (txtGroupName.Text == "新分组" || txtGroupName.Text == "New Group"))
+                txtGroupName.Text = Localization.T("新分组");
+
+            // ContextMenu 的 MenuItem 不一定会出现在普通 VisualTree 中。
+            // 这里直接设置每一项，确保点击“+”打开菜单时始终跟随当前语言。
+            if (FindResource("AddMenu") is ContextMenu addMenu)
+            {
+                if (addMenu.Items.Count > 0 && addMenu.Items[0] is MenuItem addTaskItem)
+                    addTaskItem.Header = Localization.T("新建任务");
+                if (addMenu.Items.Count > 1 && addMenu.Items[1] is MenuItem addGroupItem)
+                    addGroupItem.Header = Localization.T("新建分组");
+                if (addMenu.Items.Count > 2 && addMenu.Items[2] is MenuItem addSubGroupItem)
+                    addSubGroupItem.Header = Localization.T("新建子分组");
+            }
+
+            // 动态生成区域使用当前语言重新绘制。
+            RefreshTaskList();
+            RefreshNotesList();
+            RefreshHistoryList();
+
+                foreach (Window window in Application.Current.Windows)
+                {
+                    if (window is NoteWindow noteWindow)
+                        noteWindow.ApplyLanguage();
+                }
+
+                RaisePropertyChanged(nameof(CalendarHeaderText));
+                if (MainCalendar != null)
+                {
+                    MainCalendar.Language = System.Windows.Markup.XmlLanguage.GetLanguage(Localization.CurrentLanguage);
+                    RefreshCalendarLanguage();
+                }
+            }
+            finally
+            {
+                _isApplyingLanguage = false;
             }
         }
 
@@ -467,16 +717,16 @@ namespace DesktopCalendarWidget
                 _ = ToastNotificationManagerCompat.CreateToastNotifier();
 
                 new ToastContentBuilder()
-                    .AddText("水精灵提醒您该喝水咯(∠・ω< )⌒★")
-                    .AddText("为了您的健康，请及时补充水分！最好顺便起来走动走动！")
+                    .AddText(Localization.T("水精灵提醒您该喝水咯(∠・ω< )⌒★"))
+                    .AddText(Localization.T("为了您的健康，请及时补充水分！最好顺便起来走动走动！"))
                     .Show();
             }
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    $"Windows 通知发送失败：\n\n{ex.Message}\n\n" +
-                    "请确认 Windows 通知功能已开启，并重新启动本程序。",
-                    "通知发送失败",
+                    $"{Localization.T("通知发送失败")}：\n\n{ex.Message}\n\n" +
+                    Localization.T("请确认 Windows 通知功能已开启，并重新启动本程序。"),
+                    Localization.T("通知发送失败"),
                     MessageBoxButton.OK,
                     MessageBoxImage.Warning);
 
@@ -527,6 +777,62 @@ namespace DesktopCalendarWidget
             }), DispatcherPriority.Loaded);
         }
 
+        private void RefreshCalendarLanguage()
+        {
+            if (MainCalendar == null) return;
+
+            ApplyCalendarHeaderText();
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (MainCalendar == null) return;
+                MainCalendar.UpdateLayout();
+                ApplyCalendarHeaderText();
+            }), DispatcherPriority.Loaded);
+
+            // A Calendar can rebuild CalendarItem after the first layout pass (for example
+            // after changing DisplayDate/Language). Re-apply at ContextIdle as a final pass.
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (MainCalendar == null) return;
+                MainCalendar.UpdateLayout();
+                ApplyCalendarHeaderText();
+            }), DispatcherPriority.ContextIdle);
+        }
+
+        private void ApplyCalendarHeaderText()
+        {
+            if (MainCalendar == null) return;
+
+            MainCalendar.Language = System.Windows.Markup.XmlLanguage.GetLanguage(Localization.CurrentLanguage);
+            MainCalendar.ApplyTemplate();
+
+            // The header TextBlock lives inside CalendarItem's ControlTemplate. Set it
+            // through the template namescope so WPF's internal Calendar code cannot replace
+            // the visible text with stale culture-specific content.
+            if (MainCalendar.Template?.FindName("PART_CalendarItem", MainCalendar) is CalendarItem calendarItem)
+            {
+                calendarItem.ApplyTemplate();
+                if (calendarItem.Template?.FindName("CalendarHeaderTextBlock", calendarItem) is TextBlock header)
+                    header.Text = CalendarHeaderText;
+            }
+
+            RaisePropertyChanged(nameof(CalendarHeaderText));
+            MainCalendar.UpdateLayout();
+        }
+
+        private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject
+        {
+            int count = VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < count; i++)
+            {
+                var child = VisualTreeHelper.GetChild(parent, i);
+                if (child is T match) return match;
+                var nested = FindVisualChild<T>(child);
+                if (nested != null) return nested;
+            }
+            return null;
+        }
+
         private static void RefreshCalendarDotBindings(DependencyObject parent)
         {
             int count = VisualTreeHelper.GetChildrenCount(parent);
@@ -551,14 +857,16 @@ namespace DesktopCalendarWidget
             _currentEditingTask = taskToEdit;
             bool isEditMode = taskToEdit != null;
 
-            lblDrawerTitle.Text = isEditMode ? "修改任务" : "新建任务";
-            txtTitle.Text = isEditMode ? taskToEdit!.Title : "新任务";
+            lblDrawerTitle.Text = isEditMode ? Localization.T("修改任务") : Localization.T("新建任务");
+            txtTitle.Text = isEditMode ? taskToEdit!.Title : Localization.T("新任务");
+            PopulateTaskGroupCombo(isEditMode ? taskToEdit!.GroupId : null);
             
             dpTaskDate.SelectedDate = isEditMode ? taskToEdit!.TargetDate : (MainCalendar.SelectedDate ?? DateTime.Today);
 
             chkRecurring.IsChecked = isEditMode ? taskToEdit!.IsRecurring : false;
             txtInterval.Text = isEditMode ? taskToEdit!.RecurrenceInterval.ToString() : "1";
             chkShowInCalendar.IsChecked = isEditMode ? taskToEdit!.ShowInCalendar : true;
+            ChkRecurring_Changed(chkRecurring, new RoutedEventArgs());
 
             if (isEditMode)
             {
@@ -575,16 +883,14 @@ namespace DesktopCalendarWidget
                 cmbUnit.SelectedIndex = 0;
             }
 
-            AnimateDrawer(HistoryTransform, 650);
-            AnimateDrawer(SettingsTransform, 650);
+            CloseAllDrawersExcept(TaskEditTransform);
             AnimateDrawer(TaskEditTransform, 0);
         }
 
         private void OpenHistoryDrawer()
         {
             RefreshHistoryList();
-            AnimateDrawer(TaskEditTransform, 650);
-            AnimateDrawer(SettingsTransform, 650);
+            CloseAllDrawersExcept(HistoryTransform);
             AnimateDrawer(HistoryTransform, 0);
         }
 
@@ -618,8 +924,7 @@ namespace DesktopCalendarWidget
                 panelWaterConfig.Opacity = _currentSettings.IsWaterReminderEnabled ? 1.0 : 0.5;
             }
 
-            AnimateDrawer(TaskEditTransform, 650);
-            AnimateDrawer(HistoryTransform, 650);
+            CloseAllDrawersExcept(SettingsTransform);
             AnimateDrawer(SettingsTransform, 0);
         }
 
@@ -628,7 +933,12 @@ namespace DesktopCalendarWidget
             AnimateDrawer(TaskEditTransform, 650);
             AnimateDrawer(HistoryTransform, 650);
             AnimateDrawer(SettingsTransform, 650);
+            AnimateDrawer(GroupEditTransform, 650);
+            AnimateDrawer(NotesTransform, 650);
+            AnimateDrawer(NoteEditTransform, 650);
             _currentEditingTask = null;
+            _currentEditingGroup = null;
+            _currentEditingNote = null;
         }
 
         private void AnimateDrawer(TranslateTransform transform, double targetX)
@@ -687,7 +997,7 @@ namespace DesktopCalendarWidget
             }
             else
             {
-                MessageBox.Show("请输入有效的天数！", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(Localization.T("请输入有效的天数！"), Localization.T("提示"), MessageBoxButton.OK, MessageBoxImage.Information);
             }
         }
 
@@ -705,11 +1015,376 @@ namespace DesktopCalendarWidget
             OpenHistoryDrawer();
         }
 
+        private void PopulateTaskGroupCombo(string? selectedGroupId)
+        {
+            if (cmbTaskGroup == null) return;
+            cmbTaskGroup.Items.Clear();
+            cmbTaskGroup.Items.Add(new ComboBoxItem { Content = Localization.T("（未分组）"), Tag = "" });
+            foreach (var g in GetGroupTreeRows(null))
+            {
+                cmbTaskGroup.Items.Add(new ComboBoxItem { Content = g.Text, Tag = g.Id });
+            }
+            foreach (ComboBoxItem item in cmbTaskGroup.Items)
+            {
+                if ((item.Tag?.ToString() ?? "") == (selectedGroupId ?? "")) { item.IsSelected = true; break; }
+            }
+        }
+
+        private List<(string Id, string Text)> GetGroupTreeRows(string? parentId)
+        {
+            var result = new List<(string, string)>();
+            foreach (var g in _allGroups.Where(g => g.ParentGroupId == parentId).OrderBy(g => g.Name))
+            {
+                AddGroupRowsRecursive(g, 0, result);
+            }
+            return result;
+        }
+
+        private void AddGroupRowsRecursive(TaskGroupData group, int depth, List<(string Id, string Text)> result)
+        {
+            result.Add((group.Id, new string('　', depth) + "📁 " + group.Name));
+            foreach (var child in _allGroups.Where(g => g.ParentGroupId == group.Id).OrderBy(g => g.Name))
+                AddGroupRowsRecursive(child, depth + 1, result);
+        }
+
+        private void PopulateParentGroupCombo(string? selectedId)
+        {
+            cmbParentGroup.Items.Clear();
+            cmbParentGroup.Items.Add(new ComboBoxItem { Content = Localization.T("（顶层分组）"), Tag = "" });
+            foreach (var row in GetGroupTreeRows(null))
+            {
+                // 编辑分组时禁止把自己或自己的子分组设为父级，避免产生循环层级。
+                if (row.Id == selectedId) continue;
+                if (!string.IsNullOrWhiteSpace(selectedId) && IsGroupDescendantOf(row.Id, selectedId!)) continue;
+                cmbParentGroup.Items.Add(new ComboBoxItem { Content = row.Text, Tag = row.Id });
+            }
+            foreach (ComboBoxItem item in cmbParentGroup.Items)
+            {
+                if ((item.Tag?.ToString() ?? "") == (selectedId ?? "")) { item.IsSelected = true; break; }
+            }
+            if (cmbParentGroup.SelectedIndex < 0) cmbParentGroup.SelectedIndex = 0;
+        }
+
+        private bool IsGroupDescendantOf(string groupId, string ancestorId)
+        {
+            string? parent = _allGroups.FirstOrDefault(g => g.Id == groupId)?.ParentGroupId;
+            var visited = new HashSet<string>();
+            while (!string.IsNullOrWhiteSpace(parent) && visited.Add(parent))
+            {
+                if (parent == ancestorId) return true;
+                parent = _allGroups.FirstOrDefault(g => g.Id == parent)?.ParentGroupId;
+            }
+            return false;
+        }
+
+        private void AddMenu_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not UIElement target)
+                return;
+
+            // ContextMenu 位于 Window.Resources，不能直接通过 x:Name 访问。
+            // 每次打开时从资源中取出并设置当前按钮为 PlacementTarget。
+            if (FindResource("AddMenu") is not ContextMenu menu)
+                return;
+
+            // ContextMenu 是共享资源，因此打开前必须确保它没有挂在其他
+            // PlacementTarget 上；重新设置 PlacementTarget 即可安全复用。
+            menu.PlacementTarget = target;
+
+            // 菜单是共享资源，打开前再次同步语言，避免首次切换语言后仍显示中文。
+            if (menu.Items.Count > 0 && menu.Items[0] is MenuItem addTaskItem)
+                addTaskItem.Header = Localization.T("新建任务");
+            if (menu.Items.Count > 1 && menu.Items[1] is MenuItem addGroupItem)
+                addGroupItem.Header = Localization.T("新建分组");
+
+            menu.IsOpen = true;
+        }
+
+        private void AddGroup_Click(object sender, RoutedEventArgs e)
+        {
+            _currentEditingGroup = null;
+            lblGroupDrawerTitle.Text = Localization.T("新建分组");
+            txtGroupName.Text = Localization.T("新分组");
+            PopulateParentGroupCombo(null);
+            PopulateGroupTaskChecks(null);
+            CloseAllDrawersExcept(GroupEditTransform);
+            AnimateDrawer(GroupEditTransform, 0);
+        }
+
+        private void CloseAllDrawersExcept(TranslateTransform except)
+        {
+            if (except != TaskEditTransform) AnimateDrawer(TaskEditTransform, 650);
+            if (except != HistoryTransform) AnimateDrawer(HistoryTransform, 650);
+            if (except != SettingsTransform) AnimateDrawer(SettingsTransform, 650);
+            if (except != GroupEditTransform) AnimateDrawer(GroupEditTransform, 650);
+            if (except != NotesTransform) AnimateDrawer(NotesTransform, 650);
+            if (except != NoteEditTransform) AnimateDrawer(NoteEditTransform, 650);
+        }
+
+        private void PopulateGroupTaskChecks(string? groupId)
+        {
+            if (GroupTaskCheckPanel == null) return;
+            GroupTaskCheckPanel.Children.Clear();
+            _groupTaskChecks.Clear();
+            DateTime date = (MainCalendar?.SelectedDate ?? DateTime.Today).Date;
+            var tasks = GetTasksForDate(date).OrderBy(t => t.Title).ToList();
+            if (tasks.Count == 0)
+            {
+                GroupTaskCheckPanel.Children.Add(new TextBlock { Text = Localization.T("当前日期没有任务"), Foreground = GetThemeBrush("TextMuted"), FontSize = 10, Margin = new Thickness(2, 4, 0, 4) });
+                return;
+            }
+            foreach (var task in tasks)
+            {
+                var cb = new CheckBox
+                {
+                    Style = (Style)FindResource("CompactCheckBox"),
+                    Tag = task,
+                    IsChecked = groupId != null && task.GroupId == groupId,
+                    Foreground = GetThemeBrush("TextPrimary"),
+                    FontSize = 12,
+                    HorizontalAlignment = HorizontalAlignment.Stretch,
+                    HorizontalContentAlignment = HorizontalAlignment.Left,
+                    VerticalContentAlignment = VerticalAlignment.Center,
+                    Padding = new Thickness(0),
+                    Margin = new Thickness(0, 1, 0, 1),
+                    Cursor = Cursors.Hand,
+                    Content = task.Title
+                };
+                _groupTaskChecks.Add(cb);
+                GroupTaskCheckPanel.Children.Add(cb);
+            }
+        }
+
+        private void ConfirmGroup_Click(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(txtGroupName.Text)) { MessageBox.Show(Localization.T("分组名称不能为空！")); return; }
+            string? parentId = (cmbParentGroup.SelectedItem as ComboBoxItem)?.Tag?.ToString();
+            if (string.IsNullOrWhiteSpace(parentId)) parentId = null;
+            if (_currentEditingGroup != null)
+            {
+                _currentEditingGroup.Name = txtGroupName.Text.Trim();
+                if (_currentEditingGroup.Id != parentId) _currentEditingGroup.ParentGroupId = parentId;
+            }
+            else
+            {
+                var newGroup = new TaskGroupData { Name = txtGroupName.Text.Trim(), ParentGroupId = parentId };
+                _allGroups.Add(newGroup);
+                foreach (var cb in _groupTaskChecks)
+                    if (cb.IsChecked == true && cb.Tag is TaskItemData task) task.GroupId = newGroup.Id;
+                SaveTasks();
+            }
+            if (_currentEditingGroup != null)
+            {
+                foreach (var cb in _groupTaskChecks)
+                {
+                    if (cb.Tag is not TaskItemData task) continue;
+                    if (cb.IsChecked == true) task.GroupId = _currentEditingGroup.Id;
+                    else if (task.GroupId == _currentEditingGroup.Id) task.GroupId = null;
+                }
+                SaveTasks();
+            }
+            SaveGroups(); RefreshTaskList(); CloseDrawers_Click(sender, e);
+        }
+
+        private void OpenGroupEditDrawer(TaskGroupData group)
+        {
+            _currentEditingGroup = group;
+            lblGroupDrawerTitle.Text = Localization.T("编辑分组");
+            txtGroupName.Text = group.Name;
+            PopulateParentGroupCombo(group.ParentGroupId);
+            PopulateGroupTaskChecks(group.Id);
+            CloseAllDrawersExcept(GroupEditTransform);
+            AnimateDrawer(GroupEditTransform, 0);
+        }
+
+        private void Notes_Click(object sender, RoutedEventArgs e)
+        {
+            RefreshNotesList();
+            CloseAllDrawersExcept(NotesTransform);
+            AnimateDrawer(NotesTransform, 0);
+        }
+
+        private void AddNote_Click(object sender, RoutedEventArgs e)
+        {
+            var note = new NoteData();
+            // 新建便签的默认名称随界面语言变化；用户自己修改后的名称永远不自动翻译。
+            note.Title = Localization.T("新便签");
+            _allNotes.Add(note);
+            SaveNotes();
+            RefreshNotesList();
+            OpenNoteWindow(note);
+        }
+
+        private void PopulateNoteTaskCombo(string? selectedTaskId)
+        {
+            cmbNoteTask.Items.Clear();
+            cmbNoteTask.Items.Add(new ComboBoxItem { Content = "📌 " + Localization.T("不关联任务"), Tag = "" });
+            foreach (var task in _allTasks.OrderBy(t => t.Title))
+                cmbNoteTask.Items.Add(new ComboBoxItem { Content = "📌 " + task.Title, Tag = task.Id });
+            foreach (ComboBoxItem item in cmbNoteTask.Items)
+                if ((item.Tag?.ToString() ?? "") == (selectedTaskId ?? "")) { item.IsSelected = true; break; }
+            if (cmbNoteTask.SelectedIndex < 0) cmbNoteTask.SelectedIndex = 0;
+        }
+
+        private void OpenNoteEditDrawer(NoteData? note, bool readOnly)
+        {
+            // 便签本体始终以独立悬浮窗显示；主窗口里的抽屉只负责便签列表。
+            if (note == null)
+            {
+                note = new NoteData();
+                _allNotes.Add(note);
+                SaveNotes();
+                RefreshNotesList();
+            }
+            OpenNoteWindow(note);
+        }
+
+        private void OpenNoteWindow(NoteData note)
+        {
+            var existing = _openNoteWindows.FirstOrDefault(w => ReferenceEquals(w.Note, note));
+            if (existing != null)
+            {
+                existing.Activate();
+                return;
+            }
+
+            var window = new NoteWindow(this, note);
+            _openNoteWindows.Add(window);
+            window.Closed += (_, _) => _openNoteWindows.Remove(window);
+            window.Show();
+            window.Activate();
+        }
+
+        private void CloseNoteEdit_Click(object sender, RoutedEventArgs e)
+        {
+            AnimateDrawer(NoteEditTransform, 650);
+            _currentEditingNote = null;
+        }
+
+        public void SaveNoteFromWindow(NoteData note)
+        {
+            note.UpdatedAt = DateTime.Now;
+            SyncLinkedNoteToTask(note);
+            SaveNotes();
+            SaveTasks();
+            RefreshNotesList();
+            RefreshTaskList();
+            RefreshHistoryList();
+            RefreshCalendarView();
+        }
+
+        public void DeleteNoteFromWindow(NoteData note)
+        {
+            if (!_allNotes.Remove(note)) return;
+            SaveNotes();
+            RefreshNotesList();
+            RefreshTaskList();
+            RefreshHistoryList();
+            RefreshCalendarView();
+        }
+
+        public void SetNoteCompletionFromWindow(NoteData note, bool completed)
+        {
+            note.IsCompleted = completed;
+            SyncLinkedNoteToTask(note);
+            SaveNotes();
+            SaveTasks();
+            RefreshTaskList();
+            RefreshHistoryList();
+            RefreshCalendarView();
+        }
+
+        private void ConfirmNote_Click(object sender, RoutedEventArgs e)
+        {
+            // 兼容旧抽屉逻辑：实际编辑仍交给独立便签窗口。
+            if (_currentEditingNote != null) OpenNoteWindow(_currentEditingNote);
+            CloseNoteEdit_Click(sender, e);
+        }
+
+        private void SyncLinkedNoteToTask(NoteData note)
+        {
+            if (string.IsNullOrWhiteSpace(note.TaskId)) return;
+            var task = _allTasks.FirstOrDefault(t => t.Id == note.TaskId);
+            if (task == null) return;
+
+            DateTime date = MainCalendar?.SelectedDate?.Date ?? DateTime.Today;
+            if (!IsTaskMatchDate(task, date))
+            {
+                if (!task.IsRecurring) date = task.TargetDate.Date;
+                else
+                {
+                    var next = GetNextMatchDateAfter(task, date.AddDays(-1));
+                    if (!next.HasValue) return;
+                    date = next.Value.Date;
+                }
+            }
+
+            if (note.IsCompleted) task.CompletedDates.Add(date);
+            else task.CompletedDates.Remove(date);
+        }
+
+        private bool HasNotesForTask(string taskId) => _allNotes.Any(n => n.TaskId == taskId);
+
+        private void OpenTaskNotes(TaskItemData task)
+        {
+            var note = _allNotes.Where(n => n.TaskId == task.Id).OrderByDescending(n => n.UpdatedAt).FirstOrDefault();
+            if (note == null)
+            {
+                note = new NoteData { Title = task.Title + " " + Localization.T("的便签"), TaskId = task.Id };
+                _allNotes.Add(note);
+                SaveNotes();
+                RefreshTaskList();
+            }
+            OpenNoteWindow(note);
+        }
+
+        private void RefreshNotesList()
+        {
+            if (NotesListPanel == null) return;
+            NotesListPanel.Children.Clear();
+            var notes = _allNotes.Where(n => string.IsNullOrWhiteSpace(n.TaskId)).OrderByDescending(n => n.UpdatedAt).ToList();
+            if (notes.Count == 0)
+            {
+                NotesListPanel.Children.Add(new TextBlock { Text = Localization.T("还没有独立便签"), Foreground = GetThemeBrush("TextMuted"), Margin = new Thickness(8, 25, 0, 0), HorizontalAlignment = HorizontalAlignment.Center });
+                return;
+            }
+
+            foreach (var note in notes)
+            {
+                Border card = new Border { Background = GetThemeBrush("CardBg"), CornerRadius = new CornerRadius(8), Padding = new Thickness(9), Margin = new Thickness(0, 0, 0, 7), BorderBrush = GetThemeBrush("BorderBrushKey"), BorderThickness = new Thickness(1) };
+                Grid grid = new Grid();
+                grid.ColumnDefinitions.Add(new ColumnDefinition());
+                grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                StackPanel info = new StackPanel();
+                info.Children.Add(new TextBlock { Text = (note.IsCompleted ? "✓ " : "") + note.Title, Foreground = GetThemeBrush("TextPrimary"), FontWeight = FontWeights.Bold });
+                string preview = (note.Content ?? "").Replace("\r", "").Replace("\n", " ");
+                if (preview.Length > 70) preview = preview[..70] + "…";
+                info.Children.Add(new TextBlock { Text = preview, Foreground = GetThemeBrush("TextMuted"), FontSize = 10, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 2, 0, 0) });
+                grid.Children.Add(info);
+
+                Button open = new Button { Content = Localization.T("打开"), Padding = new Thickness(7, 3, 7, 3), Cursor = Cursors.Hand, Background = GetThemeBrush("ControlBg"), Foreground = GetThemeBrush("TextPrimary"), BorderThickness = new Thickness(0) };
+                open.Click += (s, e) => OpenNoteWindow(note);
+                Grid.SetColumn(open, 1);
+                grid.Children.Add(open);
+                card.Child = grid;
+
+                ContextMenu menu = new ContextMenu();
+                var edit = new MenuItem { Header = Localization.T("编辑便签") };
+                edit.Click += (s, e) => OpenNoteWindow(note);
+                var del = new MenuItem { Header = Localization.T("删除便签") };
+                del.Click += (s, e) => DeleteNoteFromWindow(note);
+                menu.Items.Add(edit);
+                menu.Items.Add(del);
+                card.ContextMenu = menu;
+                NotesListPanel.Children.Add(card);
+            }
+        }
+
         private void ConfirmTask_Click(object sender, RoutedEventArgs e)
         {
             if (string.IsNullOrWhiteSpace(txtTitle.Text))
             {
-                MessageBox.Show("任务名称不能为空！", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(Localization.T("任务名称不能为空！"), Localization.T("提示"), MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
@@ -727,6 +1402,8 @@ namespace DesktopCalendarWidget
             DateTime selectedTargetDate = dpTaskDate.SelectedDate ?? DateTime.Today;
             bool isRecurring = chkRecurring.IsChecked ?? false;
             bool showInCalendar = chkShowInCalendar.IsChecked ?? true;
+            string? groupId = (cmbTaskGroup?.SelectedItem as ComboBoxItem)?.Tag?.ToString();
+            if (string.IsNullOrWhiteSpace(groupId)) groupId = null;
 
             if (_currentEditingTask != null)
             {
@@ -736,6 +1413,7 @@ namespace DesktopCalendarWidget
                 _currentEditingTask.RecurrenceInterval = interval;
                 _currentEditingTask.RecurrenceUnit = unitStr;
                 _currentEditingTask.ShowInCalendar = showInCalendar;
+                _currentEditingTask.GroupId = groupId;
             }
             else
             {
@@ -746,7 +1424,8 @@ namespace DesktopCalendarWidget
                     IsRecurring = isRecurring,
                     RecurrenceInterval = interval,
                     RecurrenceUnit = unitStr,
-                    ShowInCalendar = showInCalendar
+                    ShowInCalendar = showInCalendar,
+                    GroupId = groupId
                 });
             }
 
@@ -817,9 +1496,9 @@ namespace DesktopCalendarWidget
             }
             futureTasks = futureTasks.OrderBy(t => t.DisplayDate).ToList();
 
-            AddTaskCategorySection("以前的任务 (逾期)", pastUnfinishedTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
-            AddTaskCategorySection("今日任务", todayTasks, selectedDate, isExpandedByDefault: true, showDateLabel: false);
-            AddTaskCategorySection("未来任务", futureTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
+            AddTaskCategorySection(Localization.T("逾期任务"), pastUnfinishedTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
+            AddTaskCategorySection(Localization.T("今日任务"), todayTasks, selectedDate, isExpandedByDefault: true, showDateLabel: false);
+            AddTaskCategorySection(Localization.T("未来任务"), futureTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
         }
 
         private DateTime? GetLastUnfinishedDateBefore(TaskItemData task, DateTime selectedDate)
@@ -863,222 +1542,149 @@ namespace DesktopCalendarWidget
             return null;
         }
 
-        private void AddTaskCategorySection(string categoryTitle, List<TaskDisplayModel> displayTasks, DateTime selectedDate, bool isExpandedByDefault, bool showDateLabel)
+        private Expander CreateStyledExpander(object header, bool expanded, double leftMargin, double bottomMargin)
         {
-            Expander categoryExpander = new Expander
+            var headerText = new TextBlock
             {
-                Header = $"{categoryTitle} ({displayTasks.Count})",
-                IsExpanded = isExpandedByDefault && displayTasks.Count > 0,
-                Foreground = GetThemeBrush("TextSecondary"),
+                Text = header?.ToString() ?? string.Empty,
+                Foreground = GetThemeBrush("TextPrimary"),
                 FontSize = 12,
                 FontWeight = FontWeights.Bold,
-                Margin = new Thickness(0, 0, 0, 8),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            var exp = new Expander
+            {
+                Header = headerText, IsExpanded = expanded, Foreground = GetThemeBrush("TextPrimary"),
+                FontSize = 12, FontWeight = FontWeights.Bold, Margin = new Thickness(leftMargin, 0, 0, bottomMargin),
                 HorizontalContentAlignment = HorizontalAlignment.Stretch
             };
+            exp.Template = (ControlTemplate)FindResource("ModernExpanderTemplate");
+            return exp;
+        }
 
-            if (displayTasks.Count == 0)
+        private void AddTaskCategorySection(string categoryTitle, List<TaskDisplayModel> displayTasks, DateTime selectedDate, bool isExpandedByDefault, bool showDateLabel)
+        {
+            Expander categoryExpander = CreateStyledExpander(
+                $"{categoryTitle} ({displayTasks.Count})",
+                isExpandedByDefault && displayTasks.Count > 0, 0, 8);
+            StackPanel container = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
+            bool showGroupsWhenEmpty = categoryTitle == Localization.T("今日任务") && _allGroups.Count > 0;
+            if (displayTasks.Count == 0 && !showGroupsWhenEmpty)
             {
-                categoryExpander.Content = new TextBlock
+                container.Children.Add(new TextBlock { Text = Localization.T("暂无任务"), Foreground = GetThemeBrush("TextMuted"), FontSize = 11, Margin = new Thickness(8, 4, 0, 8) });
+                categoryExpander.Content = container; TaskListPanel.Children.Add(categoryExpander); return;
+            }
+            var byGroup = displayTasks.Where(i => !string.IsNullOrWhiteSpace(i.Task.GroupId)).ToList();
+            foreach (var root in _allGroups.Where(g => g.ParentGroupId == null).OrderBy(g => g.Name))
+                AddGroupTaskSection(root, byGroup, container, 0, showDateLabel);
+            foreach (var item in displayTasks.Where(i => string.IsNullOrWhiteSpace(i.Task.GroupId))) AddTaskCard(container, item, showDateLabel);
+            categoryExpander.Content = container; TaskListPanel.Children.Add(categoryExpander);
+        }
+
+        private void AddGroupTaskSection(TaskGroupData group, List<TaskDisplayModel> items, Panel parent, int depth, bool showDateLabel)
+        {
+            var direct = items.Where(i => i.Task.GroupId == group.Id).ToList();
+            var children = _allGroups.Where(g => g.ParentGroupId == group.Id).OrderBy(g => g.Name).ToList();
+            bool hasDisplayedDescendants = children.Any(c => GroupTreeHasTasks(c, items));
+            bool showEmptyGroup = !showDateLabel;
+            if (direct.Count == 0 && !hasDisplayedDescendants && !showEmptyGroup) return;
+
+            bool isCompleted = (direct.Count + CountDisplayedChildTasks(group, items)) > 0 &&
+                               direct.All(i => i.Task.CompletedDates.Contains(i.DisplayDate.Date)) &&
+                               children.Where(c => GroupTreeHasTasks(c, items)).All(c => IsGroupCompletedForDisplay(c, items));
+
+            var header = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
+            var icon = new TextBlock { Text = isCompleted ? "✓ 📁" : "📁", FontSize = 12, Margin = new Thickness(0, 0, 5, 0), Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("AccentLightBrush") };
+            var title = new TextBlock { Text = group.Name, FontSize = 11, FontWeight = FontWeights.Bold, Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextPrimary"), TextDecorations = isCompleted ? TextDecorations.Strikethrough : null };
+            var count = new TextBlock { Text = $" ({CountGroupTasks(group, items)})", FontSize = 10, Foreground = GetThemeBrush("TextMuted") };
+            header.Children.Add(icon); header.Children.Add(title); header.Children.Add(count);
+
+            Expander exp = CreateStyledExpander(header, depth < 1, depth * 8, 5);
+            StackPanel inner = new StackPanel { Margin = new Thickness(0, 2, 0, 2) };
+            foreach (var item in direct) AddTaskCard(inner, item, showDateLabel);
+            foreach (var child in children) AddGroupTaskSection(child, items, inner, depth + 1, showDateLabel);
+            if (direct.Count == 0 && children.Count == 0)
+                inner.Children.Add(new TextBlock { Text = Localization.T("暂无任务"), Foreground = GetThemeBrush("TextMuted"), FontSize = 10, Margin = new Thickness(10, 3, 0, 6) });
+            exp.Content = inner;
+
+            var menu = new ContextMenu();
+            var addChild = new MenuItem { Header = Localization.T("新建子分组") };
+            addChild.Click += (s, e) => { _currentEditingGroup = null; lblGroupDrawerTitle.Text = Localization.T("新建子分组"); txtGroupName.Text = Localization.T("新分组"); PopulateParentGroupCombo(group.Id); CloseAllDrawersExcept(GroupEditTransform); AnimateDrawer(GroupEditTransform, 0); };
+            var editGroup = new MenuItem { Header = Localization.T("编辑分组") };
+            editGroup.Click += (s, e) => OpenGroupEditDrawer(group);
+            var delGroup = new MenuItem { Header = Localization.T("删除分组（保留任务）") };
+            delGroup.Click += (s, e) => { foreach (var t in _allTasks.Where(t => t.GroupId == group.Id)) t.GroupId = group.ParentGroupId; foreach (var c in _allGroups.Where(g => g.ParentGroupId == group.Id)) c.ParentGroupId = group.ParentGroupId; _allGroups.Remove(group); SaveGroups(); SaveTasks(); RefreshTaskList(); };
+            menu.Items.Add(addChild); menu.Items.Add(editGroup); menu.Items.Add(delGroup);
+            exp.ContextMenu = menu;
+            parent.Children.Add(exp);
+        }
+
+        private int CountDisplayedChildTasks(TaskGroupData group, List<TaskDisplayModel> items) =>
+            _allGroups.Where(g => g.ParentGroupId == group.Id).Sum(c => CountGroupTasks(c, items));
+
+        private bool IsGroupCompletedForDisplay(TaskGroupData group, List<TaskDisplayModel> items)
+        {
+            var direct = items.Where(i => i.Task.GroupId == group.Id).ToList();
+            var children = _allGroups.Where(g => g.ParentGroupId == group.Id).Where(c => GroupTreeHasTasks(c, items)).ToList();
+            int count = direct.Count + children.Sum(c => CountGroupTasks(c, items));
+            if (count == 0) return false;
+            return direct.All(i => i.Task.CompletedDates.Contains(i.DisplayDate.Date)) && children.All(c => IsGroupCompletedForDisplay(c, items));
+        }
+
+        private bool GroupTreeHasTasks(TaskGroupData group, List<TaskDisplayModel> items) => items.Any(i => i.Task.GroupId == group.Id) || _allGroups.Where(g => g.ParentGroupId == group.Id).Any(c => GroupTreeHasTasks(c, items));
+        private int CountGroupTasks(TaskGroupData group, List<TaskDisplayModel> items) => items.Count(i => i.Task.GroupId == group.Id) + _allGroups.Where(g => g.ParentGroupId == group.Id).Sum(c => CountGroupTasks(c, items));
+
+        private string GetRecurrenceUnitLabel(string unit)
+        {
+            if (Localization.IsEnglish)
+            {
+                return unit switch
                 {
-                    Text = "暂无任务",
-                    Foreground = GetThemeBrush("TextMuted"),
-                    FontSize = 11,
-                    Margin = new Thickness(8, 4, 0, 8)
+                    "Week" => "Week",
+                    "Month" => "Month",
+                    "Year" => "Year",
+                    _ => "Day"
                 };
-                TaskListPanel.Children.Add(categoryExpander);
-                return;
             }
 
-            StackPanel itemContainer = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
-
-            foreach (var item in displayTasks)
+            return unit switch
             {
-                var task = item.Task;
-                DateTime taskItemDate = item.DisplayDate.Date;
-                bool isCompleted = task.CompletedDates.Contains(taskItemDate);
+                "Week" => Localization.T("周"),
+                "Month" => Localization.T("月"),
+                "Year" => Localization.T("年"),
+                _ => Localization.T("天")
+            };
+        }
 
-                Border taskCard = new Border
-                {
-                    Background = GetThemeBrush("CardBg"),
-                    CornerRadius = new CornerRadius(6),
-                    Padding = new Thickness(8),
-                    Margin = new Thickness(0, 0, 0, 6)
-                };
-
-                Grid cardGrid = new Grid();
-                cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-                CheckBox chkStatus = new CheckBox
-                {
-                    IsChecked = isCompleted,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Margin = new Thickness(0, 0, 8, 0),
-                    Cursor = Cursors.Hand
-                };
-
-                StackPanel spText = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-
-                TextBlock txtTitle = new TextBlock
-                {
-                    Text = task.Title,
-                    Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextPrimary"),
-                    FontWeight = FontWeights.Bold,
-                    FontSize = 13,
-                    TextDecorations = isCompleted ? TextDecorations.Strikethrough : null
-                };
-                spText.Children.Add(txtTitle);
-
-                if (task.IsRecurring)
-                {
-                    spText.Children.Add(new TextBlock
-                    {
-                        Text = $"🔁 每 {task.RecurrenceInterval} {task.RecurrenceUnit}",
-                        Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("AccentLightBrush"),
-                        FontSize = 11,
-                        Margin = new Thickness(0, 2, 0, 0)
-                    });
-                }
-
-                chkStatus.Click += (s, ev) =>
-                {
-                    if (chkStatus.IsChecked == true)
-                    {
-                        task.CompletedDates.Add(taskItemDate);
-                    }
-                    else
-                    {
-                        task.CompletedDates.Remove(taskItemDate);
-                    }
-                    SaveTasks();
-                    RefreshTaskList();
-                    RefreshCalendarView();
-                };
-
-                Grid.SetColumn(chkStatus, 0);
-                Grid.SetColumn(spText, 1);
-                cardGrid.Children.Add(chkStatus);
-                cardGrid.Children.Add(spText);
-
-                // 循环任务的统计统一放在任务卡片最右侧。
-                // 未来/过去任务：日期在上，统计在日期下方；
-                // 今日任务：没有日期标签，但统计仍保持在最右侧。
-                if (showDateLabel || task.IsRecurring)
-                {
-                    StackPanel dateInfoPanel = new StackPanel
-                    {
-                        Orientation = Orientation.Vertical,
-                        VerticalAlignment = VerticalAlignment.Top,
-                        HorizontalAlignment = HorizontalAlignment.Right,
-                        Margin = new Thickness(8, 0, 2, 0)
-                    };
-
-                    if (showDateLabel)
-                    {
-                        TextBlock txtDateLabel = new TextBlock
-                        {
-                            Text = item.DisplayDate.ToString("M-d"),
-                            Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextSecondary"),
-                            FontSize = 11,
-                            VerticalAlignment = VerticalAlignment.Top,
-                            HorizontalAlignment = HorizontalAlignment.Right,
-                            Margin = new Thickness(0, -1, 0, 0)
-                        };
-                        dateInfoPanel.Children.Add(txtDateLabel);
-                    }
-
-                    if (task.IsRecurring)
-                    {
-                        (int totalCompleted, int currentStreak, int longestStreak) = GetRecurringCompletionStats(task);
-
-                        TextBlock txtTotalStats = new TextBlock
-                        {
-                            Text = $"已完成{totalCompleted}次",
-                            Foreground = GetThemeBrush("TextMuted"),
-                            FontSize = 9,
-                            HorizontalAlignment = HorizontalAlignment.Right,
-                            TextAlignment = TextAlignment.Right,
-                            Margin = new Thickness(0, showDateLabel ? 1 : 0, 0, 0)
-                        };
-                        dateInfoPanel.Children.Add(txtTotalStats);
-
-                        TextBlock txtCurrentStreak = new TextBlock
-                        {
-                            Text = $"连续完成{currentStreak}次",
-                            Foreground = GetThemeBrush("TextMuted"),
-                            FontSize = 9,
-                            HorizontalAlignment = HorizontalAlignment.Right,
-                            TextAlignment = TextAlignment.Right,
-                            Margin = new Thickness(0, 0, 0, 0)
-                        };
-                        dateInfoPanel.Children.Add(txtCurrentStreak);
-
-                        TextBlock txtLongestStreak = new TextBlock
-                        {
-                            Text = $"最长连续完成{longestStreak}次",
-                            Foreground = GetThemeBrush("TextMuted"),
-                            FontSize = 9,
-                            HorizontalAlignment = HorizontalAlignment.Right,
-                            TextAlignment = TextAlignment.Right,
-                            Margin = new Thickness(0, 0, 0, 0)
-                        };
-                        dateInfoPanel.Children.Add(txtLongestStreak);
-                    }
-
-                    Grid.SetColumn(dateInfoPanel, 2);
-                    cardGrid.Children.Add(dateInfoPanel);
-                }
-
-                taskCard.Child = cardGrid;
-
-                ContextMenu contextMenu = new ContextMenu();
-                MenuItem menuEdit = new MenuItem { Header = "编辑任务" };
-                menuEdit.Click += (s, ev) => OpenTaskEditDrawer(task);
-                contextMenu.Items.Add(menuEdit);
-
-                if (task.IsRecurring)
-                {
-                    MenuItem menuDeleteToday = new MenuItem { Header = "仅删除本日任务" };
-                    menuDeleteToday.Click += (s, ev) =>
-                    {
-                        task.SkippedDates.Add(taskItemDate);
-                        SaveTasks();
-                        RefreshTaskList();
-                        RefreshCalendarView();
-                    };
-
-                    MenuItem menuDeleteAll = new MenuItem { Header = "删除整个循环任务" };
-                    menuDeleteAll.Click += (s, ev) =>
-                    {
-                        _allTasks.Remove(task);
-                        SaveTasks();
-                        RefreshTaskList();
-                        RefreshCalendarView();
-                    };
-
-                    contextMenu.Items.Add(menuDeleteToday);
-                    contextMenu.Items.Add(menuDeleteAll);
-                }
-                else
-                {
-                    MenuItem menuDelete = new MenuItem { Header = "删除任务" };
-                    menuDelete.Click += (s, ev) =>
-                    {
-                        _allTasks.Remove(task);
-                        SaveTasks();
-                        RefreshTaskList();
-                        RefreshCalendarView();
-                    };
-                    contextMenu.Items.Add(menuDelete);
-                }
-
-                taskCard.ContextMenu = contextMenu;
-                itemContainer.Children.Add(taskCard);
+        private void AddTaskCard(Panel itemContainer, TaskDisplayModel item, bool showDateLabel)
+        {
+            var task = item.Task; DateTime taskItemDate = item.DisplayDate.Date; bool isCompleted = task.CompletedDates.Contains(taskItemDate);
+            Border taskCard = new Border { Background = GetThemeBrush("CardBg"), CornerRadius = new CornerRadius(6), Padding = new Thickness(8), Margin = new Thickness(0, 0, 0, 6) };
+            Grid cardGrid = new Grid();
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            CheckBox chkStatus = new CheckBox { Style = (Style)FindResource("CompactCheckBox"), IsChecked = isCompleted, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0), Cursor = Cursors.Hand };
+            StackPanel spText = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            spText.Children.Add(new TextBlock { Text = task.Title, Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextPrimary"), FontWeight = FontWeights.Bold, FontSize = 13, TextDecorations = isCompleted ? TextDecorations.Strikethrough : null });
+            if (task.IsRecurring) spText.Children.Add(new TextBlock { Text = $"🔁 {Localization.T("每")} {task.RecurrenceInterval} {GetRecurrenceUnitLabel(task.RecurrenceUnit)}", Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("AccentLightBrush"), FontSize = 11, Margin = new Thickness(0,2,0,0) });
+            chkStatus.Click += (s, ev) => { if (chkStatus.IsChecked == true) task.CompletedDates.Add(taskItemDate); else task.CompletedDates.Remove(taskItemDate); foreach (var n in _allNotes.Where(n => n.TaskId == task.Id)) n.IsCompleted = chkStatus.IsChecked == true; SaveTasks(); SaveNotes(); RefreshTaskList(); RefreshCalendarView(); };
+            Grid.SetColumn(chkStatus, 0); Grid.SetColumn(spText, 1); cardGrid.Children.Add(chkStatus); cardGrid.Children.Add(spText);
+            if (HasNotesForTask(task.Id)) { var nb = new Button { Content="📝", Background=GetThemeBrush("ControlBg"), Foreground=GetThemeBrush("AccentLightBrush"), BorderThickness=new Thickness(0), Padding=new Thickness(5,2,5,2), Cursor=Cursors.Hand, ToolTip=Localization.T("查看任务便签") }; nb.Click += (s,e)=>OpenTaskNotes(task); Grid.SetColumn(nb,2); cardGrid.Children.Add(nb); }
+            if (showDateLabel || task.IsRecurring)
+            {
+                StackPanel dp = new StackPanel { VerticalAlignment=VerticalAlignment.Top, HorizontalAlignment=HorizontalAlignment.Right, Margin=new Thickness(8,0,2,0) };
+                if (showDateLabel) dp.Children.Add(new TextBlock { Text=item.DisplayDate.ToString("M-d"), Foreground=isCompleted?GetThemeBrush("TextMuted"):GetThemeBrush("TextSecondary"), FontSize=11, HorizontalAlignment=HorizontalAlignment.Right });
+                if (task.IsRecurring) { var st=GetRecurringCompletionStats(task); dp.Children.Add(new TextBlock { Text=Localization.IsEnglish ? $"Completed {st.totalCompleted} times" : $"已完成{st.totalCompleted}次", Foreground=GetThemeBrush("TextMuted"), FontSize=9, HorizontalAlignment=HorizontalAlignment.Right }); dp.Children.Add(new TextBlock { Text=Localization.IsEnglish ? $"Current streak {st.currentStreak}" : $"连续完成{st.currentStreak}次", Foreground=GetThemeBrush("TextMuted"), FontSize=9, HorizontalAlignment=HorizontalAlignment.Right }); dp.Children.Add(new TextBlock { Text=Localization.IsEnglish ? $"Longest streak {st.longestStreak}" : $"最长连续{st.longestStreak}次", Foreground=GetThemeBrush("TextMuted"), FontSize=9, HorizontalAlignment=HorizontalAlignment.Right }); }
+                Grid.SetColumn(dp,3); cardGrid.Children.Add(dp);
             }
-
-            categoryExpander.Content = itemContainer;
-            TaskListPanel.Children.Add(categoryExpander);
+            taskCard.Child=cardGrid;
+            ContextMenu menu=new ContextMenu(); var edit=new MenuItem{Header=Localization.T("编辑任务")}; edit.Click+=(s,e)=>OpenTaskEditDrawer(task); menu.Items.Add(edit);
+            var addNote=new MenuItem{Header=Localization.T("新建/查看便签")}; addNote.Click+=(s,e)=>OpenTaskNotes(task); menu.Items.Add(addNote);
+            if (task.IsRecurring) { var delToday=new MenuItem{Header=Localization.T("仅删除本日任务")}; delToday.Click+=(s,e)=>{task.SkippedDates.Add(taskItemDate);SaveTasks();RefreshTaskList();RefreshCalendarView();}; menu.Items.Add(delToday); var delAll=new MenuItem{Header=Localization.T("删除整个循环任务")}; delAll.Click+=(s,e)=>{_allTasks.Remove(task);_allNotes.RemoveAll(n=>n.TaskId==task.Id);SaveTasks();SaveNotes();RefreshTaskList();RefreshCalendarView();};menu.Items.Add(delAll); }
+            else { var del=new MenuItem{Header=Localization.T("删除任务")}; del.Click+=(s,e)=>{_allTasks.Remove(task);_allNotes.RemoveAll(n=>n.TaskId==task.Id);SaveTasks();SaveNotes();RefreshTaskList();RefreshCalendarView();};menu.Items.Add(del); }
+            taskCard.ContextMenu=menu; itemContainer.Children.Add(taskCard);
         }
 
         private void RefreshHistoryList()
@@ -1101,7 +1707,7 @@ namespace DesktopCalendarWidget
             {
                 HistoryListPanel.Children.Add(new TextBlock
                 {
-                    Text = "暂无打卡记录~",
+                    Text = Localization.T("暂无打卡记录~"),
                     Foreground = GetThemeBrush("TextMuted"),
                     HorizontalAlignment = HorizontalAlignment.Center,
                     Margin = new Thickness(0, 30, 0, 0)
@@ -1125,13 +1731,10 @@ namespace DesktopCalendarWidget
                 cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
                 StackPanel spInfo = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
-                spInfo.Children.Add(new TextBlock
-                {
-                    Text = record.Task.Title,
-                    Foreground = GetThemeBrush("TextPrimary"),
-                    FontWeight = FontWeights.Bold,
-                    FontSize = 12
-                });
+                var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
+                titleRow.Children.Add(new TextBlock { Text = record.Task.Title, Foreground = GetThemeBrush("TextPrimary"), FontWeight = FontWeights.Bold, FontSize = 12 });
+                if (HasNotesForTask(record.Task.Id)) { var nbtn = new Button { Content = "📝", Background = GetThemeBrush("ControlBg"), Foreground = GetThemeBrush("AccentLightBrush"), BorderThickness = new Thickness(0), Padding = new Thickness(5,2,5,2), Cursor = Cursors.Hand, ToolTip = Localization.T("查看任务便签") }; nbtn.Click += (s,e)=>OpenTaskNotes(record.Task); titleRow.Children.Add(nbtn); }
+                spInfo.Children.Add(titleRow);
                 spInfo.Children.Add(new TextBlock
                 {
                     Text = $"📅 {record.Date:yyyy-MM-dd}",
@@ -1142,14 +1745,14 @@ namespace DesktopCalendarWidget
 
                 Button btnUndo = new Button
                 {
-                    Content = "撤回",
+                    Content = Localization.T("撤回"),
                     Background = GetThemeBrush("AccentBrush"),
                     Foreground = Brushes.White,
                     Padding = new Thickness(6, 2, 6, 2),
                     Margin = new Thickness(4, 0, 2, 0),
                     Cursor = Cursors.Hand,
                     FontSize = 11,
-                    ToolTip = "恢复为未打卡状态"
+                    ToolTip = Localization.T("恢复为未打卡状态")
                 };
                 btnUndo.Click += (s, ev) =>
                 {
@@ -1162,14 +1765,14 @@ namespace DesktopCalendarWidget
 
                 Button btnDelete = new Button
                 {
-                    Content = "删除",
+                    Content = Localization.T("删除"),
                     Background = (Brush?)new BrushConverter().ConvertFrom("#DC2626") ?? Brushes.Red,
                     Foreground = Brushes.White,
                     Padding = new Thickness(6, 2, 6, 2),
                     Margin = new Thickness(2, 0, 0, 0),
                     Cursor = Cursors.Hand,
                     FontSize = 11,
-                    ToolTip = "彻底删除此任务"
+                    ToolTip = Localization.T("彻底删除此任务")
                 };
                 btnDelete.Click += (s, ev) =>
                 {
@@ -1252,11 +1855,21 @@ namespace DesktopCalendarWidget
                     }
                 }
             };
+            // 首次启动给用户一个稳定的可见窗口；之后才按正常贴边规则工作。
+            CheckDockEdge();
             _edgeHideTimer.Start();
         }
 
         private void CheckDockEdge()
         {
+            if (!IsLoaded || ActualWidth <= 0 || ActualHeight <= 0 ||
+                double.IsNaN(Left) || double.IsNaN(Top))
+            {
+                _currentDockEdge = DockEdge.None;
+                _isHiding = false;
+                return;
+            }
+
             Rect workArea = SystemParameters.WorkArea;
             double threshold = 20.0;
 
@@ -1638,17 +2251,26 @@ namespace DesktopCalendarWidget
             }
         }
 
+        private static JsonSerializerOptions CreateJsonOptions()
+        {
+            return new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals
+            };
+        }
+
         private void SaveTasks()
         {
             try
             {
-                var options = new JsonSerializerOptions { WriteIndented = true };
+                var options = CreateJsonOptions();
                 string json = JsonSerializer.Serialize(_allTasks, options);
                 File.WriteAllText(_dataFilePath, json);
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"保存数据失败: {ex.Message}");
+                MessageBox.Show($"{Localization.T("保存数据失败")}: {ex.Message}");
             }
         }
 
@@ -1668,11 +2290,51 @@ namespace DesktopCalendarWidget
             }
         }
 
+        private void SaveGroups()
+        {
+            try
+            {
+                var options = CreateJsonOptions();
+                File.WriteAllText(_groupsFilePath, JsonSerializer.Serialize(_allGroups, options));
+            }
+            catch (Exception ex) { MessageBox.Show($"{Localization.T("保存分组失败")}: {ex.Message}"); }
+        }
+
+        private void LoadGroups()
+        {
+            try
+            {
+                if (File.Exists(_groupsFilePath))
+                    _allGroups = JsonSerializer.Deserialize<List<TaskGroupData>>(File.ReadAllText(_groupsFilePath)) ?? new List<TaskGroupData>();
+            }
+            catch { _allGroups = new List<TaskGroupData>(); }
+        }
+
+        private void SaveNotes()
+        {
+            try
+            {
+                var options = CreateJsonOptions();
+                File.WriteAllText(_notesFilePath, JsonSerializer.Serialize(_allNotes, options));
+            }
+            catch (Exception ex) { MessageBox.Show($"{Localization.T("保存便签失败")}: {ex.Message}"); }
+        }
+
+        private void LoadNotes()
+        {
+            try
+            {
+                if (File.Exists(_notesFilePath))
+                    _allNotes = JsonSerializer.Deserialize<List<NoteData>>(File.ReadAllText(_notesFilePath)) ?? new List<NoteData>();
+            }
+            catch { _allNotes = new List<NoteData>(); }
+        }
+
         private void SaveSettings()
         {
             try
             {
-                var options = new JsonSerializerOptions { WriteIndented = true };
+                var options = CreateJsonOptions();
                 string json = JsonSerializer.Serialize(_currentSettings, options);
                 File.WriteAllText(_settingsFilePath, json);
             }
@@ -1693,6 +2355,8 @@ namespace DesktopCalendarWidget
             {
                 _currentSettings = new AppSettingsData();
             }
+
+            _currentSettings.Language = NormalizeLanguageCode(_currentSettings.Language);
 
             if (_currentSettings.Opacity < 0.1 || _currentSettings.Opacity > 1.0)
             {
