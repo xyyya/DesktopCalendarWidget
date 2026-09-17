@@ -1,38 +1,30 @@
-## **只支持windows，mac不熟也不想研究，高手可以拿源码去试着改**
+## **应该只支持windows，mac不熟也不想研究，高手可以拿源码去试着改**
 # Desktop Calendar Widget (桌面日历待办组件)
 
-声明：代码由AI生成
+声明：代码全部由AI完成
 
 苦于四处寻找类似的东西，但始终无果，要么不好用，要么付费，遂大手一挥自己写了个玩玩，目前功能够我个人用了
 
-一款基于 C# WPF 开发的轻量级桌面日历与待办事项管理小组件。
+一款基于 C# WPF 开发的轻量级桌面日历与待办事项管理小组件，部分设计思路参考了《原子习惯》这本书的观点和方法，主要讲述一个习惯如何养成
 
 ## 🌟 主要特性
 - 带有每日任务小蓝点标记，完成所有任务后蓝点自动消除，转为绿点。
 - 支持单次任务与周期重复提醒（天/周/月/年）。
-- 勾选已完成任务后，自动排序下沉至列表末尾。
+- 统计循环任务的完成次数。
 - 支持靠屏幕边缘自动隐藏，鼠标悬停时唤出。
-- 内嵌抽屉查看历史打卡记录，支持一键撤回。
-- 现支持辅助养成喝水习惯，可自主调整设定
+- 内嵌抽屉查看历史打卡记录，支持一键撤回与删除。
+- 支持辅助养成喝水习惯，可自主调整设定。
+- 新增内置便签系统，可为任务添加便签，具体用途自己开发，亦可作为记事本独立存在。
+- 便签一样可以贴边隐藏，且会化作一颗小胶囊，用于提醒你还有事要干。
+- 新增任务分组功能，可以为你的任务进行分组，避免看到一长串任务列表被吓哭（？）
+- 现已支持中英文切换，根据自己喜好来。
 - 一切具体更新可以看release，或者自己上手用用，我懒得写这个.jpg
 
 ## 🛠️ 技术栈
 - C# / WPF (.NET)
 - System.Text.Json (数据持久化)
 
+
 有意见或问题可提交issue，看到了有空就改
 
 也欢迎高人拿去改（）
-
-## 🌐 Language / 语言
-
-The application now supports two UI languages:
-
-- 简体中文 (Simplified Chinese)
-- English
-
-Open **Settings → Language** to switch. The choice is saved in `settings.json` and will be restored on the next launch. Existing task, group, and note data is not translated or modified.
-
-### Build bilingual Windows release
-
-Run `Build-Bilingual-Release.bat` on a Windows machine with the .NET 8 SDK installed. It publishes a self-contained `win-x64` single-file executable into the `publish` folder.
