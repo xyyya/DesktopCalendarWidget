@@ -38,6 +38,11 @@ namespace DesktopCalendarWidget
             Localization.ApplyWpfLanguage(this);
             Localization.ApplyToVisualTree(this);
             _mainWindow = mainWindow;
+            // Make the note an owned tool window as well as ShowInTaskbar=false.
+            // This keeps floating notes out of the taskbar/Alt+Tab without changing their
+            // visible desktop behavior.
+            Owner = _mainWindow;
+            SourceInitialized += NoteWindow_SourceInitialized;
             Localization.LanguageChanged += Localization_LanguageChanged;
             Closed += NoteWindow_Closed;
             Note = note;
@@ -79,10 +84,18 @@ namespace DesktopCalendarWidget
             Dispatcher.BeginInvoke(new Action(ApplyLanguage), DispatcherPriority.Loaded);
         }
 
+        private void NoteWindow_SourceInitialized(object? sender, EventArgs e)
+        {
+            var helper = new WindowInteropHelper(this);
+            int exStyle = GetWindowLong(helper.Handle, GWL_EXSTYLE);
+            SetWindowLong(helper.Handle, GWL_EXSTYLE, exStyle | WS_EX_TOOLWINDOW);
+        }
+
         private void NoteWindow_Closed(object? sender, EventArgs e)
         {
             Localization.LanguageChanged -= Localization_LanguageChanged;
             Closed -= NoteWindow_Closed;
+            SourceInitialized -= NoteWindow_SourceInitialized;
         }
 
         private void PopulateTaskCombo()
@@ -282,6 +295,15 @@ namespace DesktopCalendarWidget
                     HideToEdge(edge);
             }
         }
+
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
 
         [DllImport("user32.dll")]
         private static extern bool GetCursorPos(out POINT lpPoint);

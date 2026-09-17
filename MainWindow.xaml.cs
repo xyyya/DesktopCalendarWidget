@@ -1047,20 +1047,30 @@ namespace DesktopCalendarWidget
                 AddGroupRowsRecursive(child, depth + 1, result);
         }
 
-        private void PopulateParentGroupCombo(string? selectedId)
+        private void PopulateParentGroupCombo(string? selectedParentId, string? excludedGroupId = null)
         {
             cmbParentGroup.Items.Clear();
             cmbParentGroup.Items.Add(new ComboBoxItem { Content = Localization.T("（顶层分组）"), Tag = "" });
             foreach (var row in GetGroupTreeRows(null))
             {
-                // 编辑分组时禁止把自己或自己的子分组设为父级，避免产生循环层级。
-                if (row.Id == selectedId) continue;
-                if (!string.IsNullOrWhiteSpace(selectedId) && IsGroupDescendantOf(row.Id, selectedId!)) continue;
+                // 编辑已有分组时，只排除“当前正在编辑的分组”及其后代。
+                // 新建子分组时，selectedParentId 本身就是要挂载的父分组，不能把它排除掉。
+                if (!string.IsNullOrWhiteSpace(excludedGroupId))
+                {
+                    if (row.Id == excludedGroupId) continue;
+                    if (IsGroupDescendantOf(row.Id, excludedGroupId!)) continue;
+                }
                 cmbParentGroup.Items.Add(new ComboBoxItem { Content = row.Text, Tag = row.Id });
             }
+
+            string wanted = selectedParentId ?? "";
             foreach (ComboBoxItem item in cmbParentGroup.Items)
             {
-                if ((item.Tag?.ToString() ?? "") == (selectedId ?? "")) { item.IsSelected = true; break; }
+                if ((item.Tag?.ToString() ?? "") == wanted)
+                {
+                    item.IsSelected = true;
+                    break;
+                }
             }
             if (cmbParentGroup.SelectedIndex < 0) cmbParentGroup.SelectedIndex = 0;
         }
@@ -1191,7 +1201,7 @@ namespace DesktopCalendarWidget
             _currentEditingGroup = group;
             lblGroupDrawerTitle.Text = Localization.T("编辑分组");
             txtGroupName.Text = group.Name;
-            PopulateParentGroupCombo(group.ParentGroupId);
+            PopulateParentGroupCombo(group.ParentGroupId, group.Id);
             PopulateGroupTaskChecks(group.Id);
             CloseAllDrawersExcept(GroupEditTransform);
             AnimateDrawer(GroupEditTransform, 0);
@@ -1544,17 +1554,29 @@ namespace DesktopCalendarWidget
 
         private Expander CreateStyledExpander(object header, bool expanded, double leftMargin, double bottomMargin)
         {
-            var headerText = new TextBlock
+            object headerContent;
+            if (header is UIElement element)
             {
-                Text = header?.ToString() ?? string.Empty,
-                Foreground = GetThemeBrush("TextPrimary"),
-                FontSize = 12,
-                FontWeight = FontWeights.Bold,
-                VerticalAlignment = VerticalAlignment.Center
-            };
+                // Group headers are already a StackPanel containing icon/title/count.
+                // Do not call ToString() on it, otherwise WPF displays
+                // "System.Windows.Controls.StackPanel" as the group name.
+                headerContent = element;
+            }
+            else
+            {
+                headerContent = new TextBlock
+                {
+                    Text = header?.ToString() ?? string.Empty,
+                    Foreground = GetThemeBrush("TextPrimary"),
+                    FontSize = 12,
+                    FontWeight = FontWeights.Bold,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+            }
+
             var exp = new Expander
             {
-                Header = headerText, IsExpanded = expanded, Foreground = GetThemeBrush("TextPrimary"),
+                Header = headerContent, IsExpanded = expanded, Foreground = GetThemeBrush("TextPrimary"),
                 FontSize = 12, FontWeight = FontWeights.Bold, Margin = new Thickness(leftMargin, 0, 0, bottomMargin),
                 HorizontalContentAlignment = HorizontalAlignment.Stretch
             };
@@ -1609,7 +1631,7 @@ namespace DesktopCalendarWidget
 
             var menu = new ContextMenu();
             var addChild = new MenuItem { Header = Localization.T("新建子分组") };
-            addChild.Click += (s, e) => { _currentEditingGroup = null; lblGroupDrawerTitle.Text = Localization.T("新建子分组"); txtGroupName.Text = Localization.T("新分组"); PopulateParentGroupCombo(group.Id); CloseAllDrawersExcept(GroupEditTransform); AnimateDrawer(GroupEditTransform, 0); };
+            addChild.Click += (s, e) => { _currentEditingGroup = null; lblGroupDrawerTitle.Text = Localization.T("新建子分组"); txtGroupName.Text = Localization.T("新分组"); PopulateParentGroupCombo(group.Id, null); CloseAllDrawersExcept(GroupEditTransform); AnimateDrawer(GroupEditTransform, 0); };
             var editGroup = new MenuItem { Header = Localization.T("编辑分组") };
             editGroup.Click += (s, e) => OpenGroupEditDrawer(group);
             var delGroup = new MenuItem { Header = Localization.T("删除分组（保留任务）") };
