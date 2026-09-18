@@ -38,7 +38,7 @@ namespace DesktopCalendarWidget
                 if (allTasksForDate.Any())
                 {
                     bool allCompleted = allTasksForDate.All(t =>
-                        t.CompletedDates.Any(d => d.Date == date.Date));
+                        MainWindow.IsTaskCompletedOnDate(t, date));
 
                     if (allCompleted)
                     {
@@ -50,7 +50,7 @@ namespace DesktopCalendarWidget
                     bool hasUncompletedNonRecurringTask = allTasksForDate
                         .Where(t => t.ShowInCalendar)
                         .Any(t => !t.IsRecurring &&
-                                  !t.CompletedDates.Any(d => d.Date == date.Date));
+                                  !MainWindow.IsTaskCompletedOnDate(t, date));
 
                     if (hasUncompletedNonRecurringTask)
                     {
@@ -112,7 +112,7 @@ namespace DesktopCalendarWidget
             {
                 var lines = tasks.Select(t =>
                 {
-                    bool isCompleted = t.CompletedDates.Contains(targetDate.Date);
+                    bool isCompleted = MainWindow.IsTaskCompletedOnDate(t, targetDate.Date);
                     string statusMark = isCompleted ? "[✓]" : "[ ]";
                     return $"{statusMark} {t.Title}";
                 });
@@ -243,6 +243,8 @@ namespace DesktopCalendarWidget
         private DispatcherTimer? _waterTimer;
         private DateTime _lastCheckedDate = DateTime.Today;
         private bool _isApplyingLanguage;
+        // 动态重建任务列表前保存 Expander 展开状态，避免勾选任务后把用户手动收起的分组重新展开。
+        private readonly Dictionary<string, bool> _expanderStates = new Dictionary<string, bool>();
 
         public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -525,9 +527,10 @@ namespace DesktopCalendarWidget
 
                 Localization.ApplyToVisualTree(this);
 
-                // The language label is a normal UI label and follows the selected UI language.
-                if (lblLanguage != null)
-                    lblLanguage.Text = Localization.T("界面语言");
+                // Resolve the language label by name instead of relying on a generated field.
+                // This avoids a XAML name-field generation issue in some WPF build paths.
+                if (FindName("lblLanguage") is TextBlock languageLabel)
+                    languageLabel.Text = Localization.T("界面语言");
 
                 // Language selector is intentionally excluded from generic localization.
                 // Keep both native language names and select by index only.
@@ -755,6 +758,39 @@ namespace DesktopCalendarWidget
         {
             DateTime pureDate = date.Date;
             return _allTasks.Where(task => IsTaskMatchDate(task, pureDate)).ToList();
+        }
+
+        // 完成状态统一按“自然日”比较，而不是 DateTime 精确相等。
+        // 这样历史数据即使保存了时间部分，日历小点与任务复选框也不会出现状态不一致。
+        public static bool IsTaskCompletedOnDate(TaskItemData task, DateTime date)
+        {
+            return task.CompletedDates != null && task.CompletedDates.Any(d => d.Date == date.Date);
+        }
+
+        private void CaptureExpanderStates(DependencyObject parent)
+        {
+            if (parent is Expander exp && exp.Tag is string key && !string.IsNullOrWhiteSpace(key))
+            {
+                _expanderStates[key] = exp.IsExpanded;
+            }
+
+            if (parent is Panel panel)
+            {
+                foreach (UIElement child in panel.Children)
+                    CaptureExpanderStates(child);
+            }
+
+            if (parent is Expander expander && expander.Content is DependencyObject content)
+            {
+                CaptureExpanderStates(content);
+            }
+        }
+
+        private bool ResolveExpanderExpanded(bool defaultExpanded, string? stateKey)
+        {
+            if (!string.IsNullOrWhiteSpace(stateKey) && _expanderStates.TryGetValue(stateKey, out bool previous))
+                return previous;
+            return defaultExpanded;
         }
 
         private void RefreshCalendarView()
@@ -1329,8 +1365,8 @@ namespace DesktopCalendarWidget
                 }
             }
 
-            if (note.IsCompleted) task.CompletedDates.Add(date);
-            else task.CompletedDates.Remove(date);
+            task.CompletedDates.RemoveWhere(d => d.Date == date.Date);
+            if (note.IsCompleted) task.CompletedDates.Add(date.Date);
         }
 
         private bool HasNotesForTask(string taskId) => _allNotes.Any(n => n.TaskId == taskId);
@@ -1459,13 +1495,15 @@ namespace DesktopCalendarWidget
         private void RefreshTaskList()
         {
             if (TaskListPanel == null) return;
+            // 任务卡片刷新会重建所有 Expander；先记录当前状态，再重新创建。
+            CaptureExpanderStates(TaskListPanel);
             TaskListPanel.Children.Clear();
 
             DateTime selectedDate = (MainCalendar.SelectedDate ?? DateTime.Today).Date;
 
             var todayTasks = _allTasks
                 .Where(t => IsTaskMatchDate(t, selectedDate))
-                .OrderBy(t => t.CompletedDates.Contains(selectedDate))
+                .OrderBy(t => IsTaskCompletedOnDate(t, selectedDate))
                 .Select(t => new TaskDisplayModel { Task = t, DisplayDate = selectedDate })
                 .ToList();
 
@@ -1506,16 +1544,16 @@ namespace DesktopCalendarWidget
             }
             futureTasks = futureTasks.OrderBy(t => t.DisplayDate).ToList();
 
-            AddTaskCategorySection(Localization.T("逾期任务"), pastUnfinishedTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
-            AddTaskCategorySection(Localization.T("今日任务"), todayTasks, selectedDate, isExpandedByDefault: true, showDateLabel: false);
-            AddTaskCategorySection(Localization.T("未来任务"), futureTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
+            AddTaskCategorySection("overdue", Localization.T("逾期任务"), pastUnfinishedTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
+            AddTaskCategorySection("today", Localization.T("今日任务"), todayTasks, selectedDate, isExpandedByDefault: true, showDateLabel: false);
+            AddTaskCategorySection("future", Localization.T("未来任务"), futureTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
         }
 
         private DateTime? GetLastUnfinishedDateBefore(TaskItemData task, DateTime selectedDate)
         {
             if (!task.IsRecurring)
             {
-                if (task.TargetDate.Date < selectedDate && !task.CompletedDates.Contains(task.TargetDate.Date))
+                if (task.TargetDate.Date < selectedDate && !IsTaskCompletedOnDate(task, task.TargetDate.Date))
                 {
                     return task.TargetDate.Date;
                 }
@@ -1524,7 +1562,7 @@ namespace DesktopCalendarWidget
 
             for (DateTime d = selectedDate.AddDays(-1); d >= task.TargetDate.Date; d = d.AddDays(-1))
             {
-                if (IsTaskMatchDate(task, d) && !task.CompletedDates.Contains(d))
+                if (IsTaskMatchDate(task, d) && !IsTaskCompletedOnDate(task, d))
                 {
                     return d;
                 }
@@ -1552,7 +1590,7 @@ namespace DesktopCalendarWidget
             return null;
         }
 
-        private Expander CreateStyledExpander(object header, bool expanded, double leftMargin, double bottomMargin)
+        private Expander CreateStyledExpander(object header, bool expanded, double leftMargin, double bottomMargin, string? stateKey = null)
         {
             object headerContent;
             if (header is UIElement element)
@@ -1576,7 +1614,7 @@ namespace DesktopCalendarWidget
 
             var exp = new Expander
             {
-                Header = headerContent, IsExpanded = expanded, Foreground = GetThemeBrush("TextPrimary"),
+                Header = headerContent, IsExpanded = ResolveExpanderExpanded(expanded, stateKey), Tag = stateKey, Foreground = GetThemeBrush("TextPrimary"),
                 FontSize = 12, FontWeight = FontWeights.Bold, Margin = new Thickness(leftMargin, 0, 0, bottomMargin),
                 HorizontalContentAlignment = HorizontalAlignment.Stretch
             };
@@ -1584,11 +1622,11 @@ namespace DesktopCalendarWidget
             return exp;
         }
 
-        private void AddTaskCategorySection(string categoryTitle, List<TaskDisplayModel> displayTasks, DateTime selectedDate, bool isExpandedByDefault, bool showDateLabel)
+        private void AddTaskCategorySection(string categoryKey, string categoryTitle, List<TaskDisplayModel> displayTasks, DateTime selectedDate, bool isExpandedByDefault, bool showDateLabel)
         {
             Expander categoryExpander = CreateStyledExpander(
                 $"{categoryTitle} ({displayTasks.Count})",
-                isExpandedByDefault && displayTasks.Count > 0, 0, 8);
+                isExpandedByDefault && displayTasks.Count > 0, 0, 8, $"category:{categoryKey}");
             StackPanel container = new StackPanel { Margin = new Thickness(0, 4, 0, 0) };
             bool showGroupsWhenEmpty = categoryTitle == Localization.T("今日任务") && _allGroups.Count > 0;
             if (displayTasks.Count == 0 && !showGroupsWhenEmpty)
@@ -1612,7 +1650,7 @@ namespace DesktopCalendarWidget
             if (direct.Count == 0 && !hasDisplayedDescendants && !showEmptyGroup) return;
 
             bool isCompleted = (direct.Count + CountDisplayedChildTasks(group, items)) > 0 &&
-                               direct.All(i => i.Task.CompletedDates.Contains(i.DisplayDate.Date)) &&
+                               direct.All(i => IsTaskCompletedOnDate(i.Task, i.DisplayDate.Date)) &&
                                children.Where(c => GroupTreeHasTasks(c, items)).All(c => IsGroupCompletedForDisplay(c, items));
 
             var header = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
@@ -1621,7 +1659,7 @@ namespace DesktopCalendarWidget
             var count = new TextBlock { Text = $" ({CountGroupTasks(group, items)})", FontSize = 10, Foreground = GetThemeBrush("TextMuted") };
             header.Children.Add(icon); header.Children.Add(title); header.Children.Add(count);
 
-            Expander exp = CreateStyledExpander(header, depth < 1, depth * 8, 5);
+            Expander exp = CreateStyledExpander(header, depth < 1, depth * 8, 5, $"group:{group.Id}");
             StackPanel inner = new StackPanel { Margin = new Thickness(0, 2, 0, 2) };
             foreach (var item in direct) AddTaskCard(inner, item, showDateLabel);
             foreach (var child in children) AddGroupTaskSection(child, items, inner, depth + 1, showDateLabel);
@@ -1650,7 +1688,7 @@ namespace DesktopCalendarWidget
             var children = _allGroups.Where(g => g.ParentGroupId == group.Id).Where(c => GroupTreeHasTasks(c, items)).ToList();
             int count = direct.Count + children.Sum(c => CountGroupTasks(c, items));
             if (count == 0) return false;
-            return direct.All(i => i.Task.CompletedDates.Contains(i.DisplayDate.Date)) && children.All(c => IsGroupCompletedForDisplay(c, items));
+            return direct.All(i => IsTaskCompletedOnDate(i.Task, i.DisplayDate.Date)) && children.All(c => IsGroupCompletedForDisplay(c, items));
         }
 
         private bool GroupTreeHasTasks(TaskGroupData group, List<TaskDisplayModel> items) => items.Any(i => i.Task.GroupId == group.Id) || _allGroups.Where(g => g.ParentGroupId == group.Id).Any(c => GroupTreeHasTasks(c, items));
@@ -1680,7 +1718,7 @@ namespace DesktopCalendarWidget
 
         private void AddTaskCard(Panel itemContainer, TaskDisplayModel item, bool showDateLabel)
         {
-            var task = item.Task; DateTime taskItemDate = item.DisplayDate.Date; bool isCompleted = task.CompletedDates.Contains(taskItemDate);
+            var task = item.Task; DateTime taskItemDate = item.DisplayDate.Date; bool isCompleted = IsTaskCompletedOnDate(task, taskItemDate);
             Border taskCard = new Border { Background = GetThemeBrush("CardBg"), CornerRadius = new CornerRadius(6), Padding = new Thickness(8), Margin = new Thickness(0, 0, 0, 6) };
             Grid cardGrid = new Grid();
             cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -1691,7 +1729,22 @@ namespace DesktopCalendarWidget
             StackPanel spText = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
             spText.Children.Add(new TextBlock { Text = task.Title, Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("TextPrimary"), FontWeight = FontWeights.Bold, FontSize = 13, TextDecorations = isCompleted ? TextDecorations.Strikethrough : null });
             if (task.IsRecurring) spText.Children.Add(new TextBlock { Text = $"🔁 {Localization.T("每")} {task.RecurrenceInterval} {GetRecurrenceUnitLabel(task.RecurrenceUnit)}", Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("AccentLightBrush"), FontSize = 11, Margin = new Thickness(0,2,0,0) });
-            chkStatus.Click += (s, ev) => { if (chkStatus.IsChecked == true) task.CompletedDates.Add(taskItemDate); else task.CompletedDates.Remove(taskItemDate); foreach (var n in _allNotes.Where(n => n.TaskId == task.Id)) n.IsCompleted = chkStatus.IsChecked == true; SaveTasks(); SaveNotes(); RefreshTaskList(); RefreshCalendarView(); };
+            chkStatus.Click += (s, ev) =>
+            {
+                bool completed = chkStatus.IsChecked == true;
+                // 始终按自然日维护完成记录，清理旧数据中可能带有时间部分的重复日期。
+                task.CompletedDates.RemoveWhere(d => d.Date == taskItemDate.Date);
+                if (completed)
+                    task.CompletedDates.Add(taskItemDate.Date);
+
+                foreach (var n in _allNotes.Where(n => n.TaskId == task.Id))
+                    n.IsCompleted = completed;
+
+                SaveTasks();
+                SaveNotes();
+                RefreshTaskList();
+                RefreshCalendarView();
+            };
             Grid.SetColumn(chkStatus, 0); Grid.SetColumn(spText, 1); cardGrid.Children.Add(chkStatus); cardGrid.Children.Add(spText);
             if (HasNotesForTask(task.Id)) { var nb = new Button { Content="📝", Background=GetThemeBrush("ControlBg"), Foreground=GetThemeBrush("AccentLightBrush"), BorderThickness=new Thickness(0), Padding=new Thickness(5,2,5,2), Cursor=Cursors.Hand, ToolTip=Localization.T("查看任务便签") }; nb.Click += (s,e)=>OpenTaskNotes(task); Grid.SetColumn(nb,2); cardGrid.Children.Add(nb); }
             if (showDateLabel || task.IsRecurring)
