@@ -243,8 +243,10 @@ namespace DesktopCalendarWidget
         private DispatcherTimer? _waterTimer;
         private DateTime _lastCheckedDate = DateTime.Today;
         private bool _isApplyingLanguage;
-        // 动态重建任务列表前保存 Expander 展开状态，避免勾选任务后把用户手动收起的分组重新展开。
+        // 动态重建任务列表前保存 Expander 展开状态；同一分组可能同时出现在逾期/今日/未来多个区域，因此状态键包含 categoryKey。
         private readonly Dictionary<string, bool> _expanderStates = new Dictionary<string, bool>();
+        private bool _isRefreshingTaskList;
+        private bool _isRestoringExpanderStates;
 
         public event PropertyChangedEventHandler? PropertyChanged;
 
@@ -767,12 +769,19 @@ namespace DesktopCalendarWidget
             return task.CompletedDates != null && task.CompletedDates.Any(d => d.Date == date.Date);
         }
 
-        private void CaptureExpanderStates(DependencyObject parent)
+        private void RememberExpanderState(Expander? exp)
         {
-            if (parent is Expander exp && exp.Tag is string key && !string.IsNullOrWhiteSpace(key))
-            {
+            if (_isRestoringExpanderStates) return;
+            if (exp?.Tag is string key && !string.IsNullOrWhiteSpace(key))
                 _expanderStates[key] = exp.IsExpanded;
-            }
+        }
+
+        private void CaptureExpanderStates(DependencyObject? parent)
+        {
+            if (parent == null) return;
+
+            if (parent is Expander exp)
+                RememberExpanderState(exp);
 
             if (parent is Panel panel)
             {
@@ -780,9 +789,19 @@ namespace DesktopCalendarWidget
                     CaptureExpanderStates(child);
             }
 
+            // 收起时 Expander 的 Content 可能不在视觉树中，但仍存在于 Content 属性。
             if (parent is Expander expander && expander.Content is DependencyObject content)
-            {
                 CaptureExpanderStates(content);
+        }
+
+        private void RememberAncestorExpanderStates(DependencyObject? child)
+        {
+            DependencyObject? current = child;
+            while (current != null)
+            {
+                if (current is Expander exp)
+                    RememberExpanderState(exp);
+                current = VisualTreeHelper.GetParent(current);
             }
         }
 
@@ -800,9 +819,10 @@ namespace DesktopCalendarWidget
             // 让 Converter 重新计算。
             CalendarRefreshVersion++;
 
-            var current = MainCalendar.SelectedDate;
-            MainCalendar.SelectedDate = null;
-            MainCalendar.SelectedDate = current;
+            // 不再通过“SelectedDate = null → 恢复”强制刷新 Calendar。
+            // 那种做法会触发 SelectedDatesChanged，从而再次重建任务列表，
+            // 造成 Expander 状态被重复覆盖，表现为用户刚收起的分组又自动展开。
+            // CalendarRefreshVersion 已经作为 MultiBinding 输入，足以让日期圆点重新计算。
 
             // WPF Calendar 的 CalendarDayButton 有时不会因为内部任务数据变化
             // 自动重绘模板里的 MultiBinding，因此再主动刷新已经生成的 Ellipse。
@@ -1494,10 +1514,15 @@ namespace DesktopCalendarWidget
 
         private void RefreshTaskList()
         {
-            if (TaskListPanel == null) return;
-            // 任务卡片刷新会重建所有 Expander；先记录当前状态，再重新创建。
-            CaptureExpanderStates(TaskListPanel);
-            TaskListPanel.Children.Clear();
+            if (TaskListPanel == null || _isRefreshingTaskList) return;
+
+            _isRefreshingTaskList = true;
+            try
+            {
+                // 任务卡片刷新会重建所有 Expander；先记录当前状态，再重新创建。
+                CaptureExpanderStates(TaskListPanel);
+                var expanderStateSnapshot = new Dictionary<string, bool>(_expanderStates);
+                TaskListPanel.Children.Clear();
 
             DateTime selectedDate = (MainCalendar.SelectedDate ?? DateTime.Today).Date;
 
@@ -1544,9 +1569,56 @@ namespace DesktopCalendarWidget
             }
             futureTasks = futureTasks.OrderBy(t => t.DisplayDate).ToList();
 
-            AddTaskCategorySection("overdue", Localization.T("逾期任务"), pastUnfinishedTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
-            AddTaskCategorySection("today", Localization.T("今日任务"), todayTasks, selectedDate, isExpandedByDefault: true, showDateLabel: false);
-            AddTaskCategorySection("future", Localization.T("未来任务"), futureTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
+                AddTaskCategorySection("overdue", Localization.T("逾期任务"), pastUnfinishedTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
+                AddTaskCategorySection("today", Localization.T("今日任务"), todayTasks, selectedDate, isExpandedByDefault: true, showDateLabel: false);
+                AddTaskCategorySection("future", Localization.T("未来任务"), futureTasks, selectedDate, isExpandedByDefault: false, showDateLabel: true);
+
+                // WPF's template binding can re-apply IsExpanded during measure/layout.
+                // Restore the pre-refresh snapshot after the entire new tree has loaded.
+                Dispatcher.BeginInvoke(new Action(() => RestoreExpanderStates(TaskListPanel, expanderStateSnapshot)), DispatcherPriority.ContextIdle);
+            }
+            finally
+            {
+                _isRefreshingTaskList = false;
+            }
+        }
+
+        private void RestoreExpanderStates(Panel panel, IReadOnlyDictionary<string, bool> snapshot)
+        {
+            if (panel == null || snapshot == null || snapshot.Count == 0) return;
+
+            _isRestoringExpanderStates = true;
+            try
+            {
+                foreach (Expander exp in FindExpanders(panel))
+                {
+                    if (exp.Tag is string key && snapshot.TryGetValue(key, out bool state))
+                        exp.IsExpanded = state;
+                }
+            }
+            finally
+            {
+                _isRestoringExpanderStates = false;
+            }
+        }
+
+        private static IEnumerable<Expander> FindExpanders(DependencyObject parent)
+        {
+            if (parent is Expander expander)
+                yield return expander;
+
+            int visualCount = VisualTreeHelper.GetChildrenCount(parent);
+            for (int i = 0; i < visualCount; i++)
+            {
+                foreach (var nested in FindExpanders(VisualTreeHelper.GetChild(parent, i)))
+                    yield return nested;
+            }
+
+            if (parent is Expander contentExpander && contentExpander.Content is DependencyObject content)
+            {
+                foreach (var nested in FindExpanders(content))
+                    yield return nested;
+            }
         }
 
         private DateTime? GetLastUnfinishedDateBefore(TaskItemData task, DateTime selectedDate)
@@ -1614,11 +1686,44 @@ namespace DesktopCalendarWidget
 
             var exp = new Expander
             {
-                Header = headerContent, IsExpanded = ResolveExpanderExpanded(expanded, stateKey), Tag = stateKey, Foreground = GetThemeBrush("TextPrimary"),
-                FontSize = 12, FontWeight = FontWeights.Bold, Margin = new Thickness(leftMargin, 0, 0, bottomMargin),
+                Header = headerContent,
+                Tag = stateKey,
+                Foreground = GetThemeBrush("TextPrimary"),
+                FontSize = 12,
+                FontWeight = FontWeights.Bold,
+                Margin = new Thickness(leftMargin, 0, 0, bottomMargin),
                 HorizontalContentAlignment = HorizontalAlignment.Stretch
             };
             exp.Template = (ControlTemplate)FindResource("ModernExpanderTemplate");
+            exp.IsExpanded = ResolveExpanderExpanded(expanded, stateKey);
+
+            bool handlersAttached = false;
+            RoutedEventHandler loadedHandler = null!;
+            loadedHandler = (s, e) =>
+            {
+                if (handlersAttached) return;
+
+                // The ModernExpanderTemplate contains a TwoWay binding between
+                // HeaderToggle.IsChecked and Expander.IsExpanded. During template
+                // loading WPF can write a transient value back to IsExpanded.
+                // Attach state handlers only after that initialization has settled.
+                if (stateKey is string key && _expanderStates.TryGetValue(key, out bool previous))
+                {
+                    _isRestoringExpanderStates = true;
+                    try { exp.IsExpanded = previous; }
+                    finally { _isRestoringExpanderStates = false; }
+                }
+                else
+                {
+                    RememberExpanderState(exp);
+                }
+
+                exp.Expanded += (s2, e2) => RememberExpanderState(exp);
+                exp.Collapsed += (s2, e2) => RememberExpanderState(exp);
+                handlersAttached = true;
+                exp.Loaded -= loadedHandler;
+            };
+            exp.Loaded += loadedHandler;
             return exp;
         }
 
@@ -1636,12 +1741,12 @@ namespace DesktopCalendarWidget
             }
             var byGroup = displayTasks.Where(i => !string.IsNullOrWhiteSpace(i.Task.GroupId)).ToList();
             foreach (var root in _allGroups.Where(g => g.ParentGroupId == null).OrderBy(g => g.Name))
-                AddGroupTaskSection(root, byGroup, container, 0, showDateLabel);
+                AddGroupTaskSection(root, byGroup, container, 0, showDateLabel, categoryKey);
             foreach (var item in displayTasks.Where(i => string.IsNullOrWhiteSpace(i.Task.GroupId))) AddTaskCard(container, item, showDateLabel);
             categoryExpander.Content = container; TaskListPanel.Children.Add(categoryExpander);
         }
 
-        private void AddGroupTaskSection(TaskGroupData group, List<TaskDisplayModel> items, Panel parent, int depth, bool showDateLabel)
+        private void AddGroupTaskSection(TaskGroupData group, List<TaskDisplayModel> items, Panel parent, int depth, bool showDateLabel, string categoryKey)
         {
             var direct = items.Where(i => i.Task.GroupId == group.Id).ToList();
             var children = _allGroups.Where(g => g.ParentGroupId == group.Id).OrderBy(g => g.Name).ToList();
@@ -1659,10 +1764,10 @@ namespace DesktopCalendarWidget
             var count = new TextBlock { Text = $" ({CountGroupTasks(group, items)})", FontSize = 10, Foreground = GetThemeBrush("TextMuted") };
             header.Children.Add(icon); header.Children.Add(title); header.Children.Add(count);
 
-            Expander exp = CreateStyledExpander(header, depth < 1, depth * 8, 5, $"group:{group.Id}");
+            Expander exp = CreateStyledExpander(header, depth < 1, depth * 8, 5, $"group:{categoryKey}:{group.Id}");
             StackPanel inner = new StackPanel { Margin = new Thickness(0, 2, 0, 2) };
             foreach (var item in direct) AddTaskCard(inner, item, showDateLabel);
-            foreach (var child in children) AddGroupTaskSection(child, items, inner, depth + 1, showDateLabel);
+            foreach (var child in children) AddGroupTaskSection(child, items, inner, depth + 1, showDateLabel, categoryKey);
             if (direct.Count == 0 && children.Count == 0)
                 inner.Children.Add(new TextBlock { Text = Localization.T("暂无任务"), Foreground = GetThemeBrush("TextMuted"), FontSize = 10, Margin = new Thickness(10, 3, 0, 6) });
             exp.Content = inner;
@@ -1731,6 +1836,10 @@ namespace DesktopCalendarWidget
             if (task.IsRecurring) spText.Children.Add(new TextBlock { Text = $"🔁 {Localization.T("每")} {task.RecurrenceInterval} {GetRecurrenceUnitLabel(task.RecurrenceUnit)}", Foreground = isCompleted ? GetThemeBrush("TextMuted") : GetThemeBrush("AccentLightBrush"), FontSize = 11, Margin = new Thickness(0,2,0,0) });
             chkStatus.Click += (s, ev) =>
             {
+                // Capture the complete tree immediately before the task state changes.
+                // Do not rely on the checkbox's visual ancestors: the Expander header/content
+                // is generated from a ControlTemplate, so the visual-parent chain can vary.
+                CaptureExpanderStates(TaskListPanel);
                 bool completed = chkStatus.IsChecked == true;
                 // 始终按自然日维护完成记录，清理旧数据中可能带有时间部分的重复日期。
                 task.CompletedDates.RemoveWhere(d => d.Date == taskItemDate.Date);
