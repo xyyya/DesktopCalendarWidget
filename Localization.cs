@@ -115,6 +115,7 @@ namespace DesktopCalendarWidget
             ["撤回"] = "Undo",
             ["恢复为未打卡状态"] = "Restore to unchecked",
             ["彻底删除此任务"] = "Permanently delete this task",
+            ["恢复已删除任务"] = "Restore deleted task",
             ["查看任务便签"] = "View task note",
             ["水精灵提醒您该喝水咯(∠・ω< )⌒★"] = "Aqua Sprite says it's time to drink some water (∠・ω< )⌒★",
             ["为了您的健康，请及时补充水分！最好顺便起来走动走动！"] = "For your health, please stay hydrated! It's also a good time to stand up and move around!",

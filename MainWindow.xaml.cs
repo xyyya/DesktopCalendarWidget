@@ -168,6 +168,9 @@ namespace DesktopCalendarWidget
             public bool ShowInCalendar { get; set; } = true;
             public HashSet<DateTime> CompletedDates { get; set; } = new HashSet<DateTime>();
             public HashSet<DateTime> SkippedDates { get; set; } = new HashSet<DateTime>();
+            // Deleted tasks remain in history and can be restored or permanently removed.
+            public bool IsDeleted { get; set; } = false;
+            public DateTime? DeletedAt { get; set; }
             // 新版层级分组：为空表示未分组；支持无限层级。
             public string? GroupId { get; set; }
         }
@@ -759,7 +762,7 @@ namespace DesktopCalendarWidget
         public List<TaskItemData> GetTasksForDate(DateTime date)
         {
             DateTime pureDate = date.Date;
-            return _allTasks.Where(task => IsTaskMatchDate(task, pureDate)).ToList();
+            return _allTasks.Where(task => !task.IsDeleted && IsTaskMatchDate(task, pureDate)).ToList();
         }
 
         // 完成状态统一按“自然日”比较，而不是 DateTime 精确相等。
@@ -1285,7 +1288,7 @@ namespace DesktopCalendarWidget
         {
             cmbNoteTask.Items.Clear();
             cmbNoteTask.Items.Add(new ComboBoxItem { Content = "📌 " + Localization.T("不关联任务"), Tag = "" });
-            foreach (var task in _allTasks.OrderBy(t => t.Title))
+            foreach (var task in _allTasks.Where(t => !t.IsDeleted).OrderBy(t => t.Title))
                 cmbNoteTask.Items.Add(new ComboBoxItem { Content = "📌 " + task.Title, Tag = task.Id });
             foreach (ComboBoxItem item in cmbNoteTask.Items)
                 if ((item.Tag?.ToString() ?? "") == (selectedTaskId ?? "")) { item.IsSelected = true; break; }
@@ -1527,7 +1530,7 @@ namespace DesktopCalendarWidget
             DateTime selectedDate = (MainCalendar.SelectedDate ?? DateTime.Today).Date;
 
             var todayTasks = _allTasks
-                .Where(t => IsTaskMatchDate(t, selectedDate))
+                .Where(t => !t.IsDeleted && IsTaskMatchDate(t, selectedDate))
                 .OrderBy(t => IsTaskCompletedOnDate(t, selectedDate))
                 .Select(t => new TaskDisplayModel { Task = t, DisplayDate = selectedDate })
                 .ToList();
@@ -1537,6 +1540,7 @@ namespace DesktopCalendarWidget
             var pastUnfinishedTasks = new List<TaskDisplayModel>();
             foreach (var t in _allTasks)
             {
+                if (t.IsDeleted) continue;
                 if (todayTaskIds.Contains(t.Id)) continue;
                 if (t.TargetDate.Date < selectedDate)
                 {
@@ -1555,6 +1559,7 @@ namespace DesktopCalendarWidget
             var futureTasks = new List<TaskDisplayModel>();
             foreach (var t in _allTasks)
             {
+                if (t.IsDeleted) continue;
                 if (todayTaskIds.Contains(t.Id)) continue;
 
                 DateTime? nextDate = GetNextMatchDateAfter(t, selectedDate);
@@ -1866,8 +1871,8 @@ namespace DesktopCalendarWidget
             taskCard.Child=cardGrid;
             ContextMenu menu=new ContextMenu(); var edit=new MenuItem{Header=Localization.T("编辑任务")}; edit.Click+=(s,e)=>OpenTaskEditDrawer(task); menu.Items.Add(edit);
             var addNote=new MenuItem{Header=Localization.T("新建/查看便签")}; addNote.Click+=(s,e)=>OpenTaskNotes(task); menu.Items.Add(addNote);
-            if (task.IsRecurring) { var delToday=new MenuItem{Header=Localization.T("仅删除本日任务")}; delToday.Click+=(s,e)=>{task.SkippedDates.Add(taskItemDate);SaveTasks();RefreshTaskList();RefreshCalendarView();}; menu.Items.Add(delToday); var delAll=new MenuItem{Header=Localization.T("删除整个循环任务")}; delAll.Click+=(s,e)=>{_allTasks.Remove(task);_allNotes.RemoveAll(n=>n.TaskId==task.Id);SaveTasks();SaveNotes();RefreshTaskList();RefreshCalendarView();};menu.Items.Add(delAll); }
-            else { var del=new MenuItem{Header=Localization.T("删除任务")}; del.Click+=(s,e)=>{_allTasks.Remove(task);_allNotes.RemoveAll(n=>n.TaskId==task.Id);SaveTasks();SaveNotes();RefreshTaskList();RefreshCalendarView();};menu.Items.Add(del); }
+            if (task.IsRecurring) { var delToday=new MenuItem{Header=Localization.T("仅删除本日任务")}; delToday.Click+=(s,e)=>{task.SkippedDates.Add(taskItemDate.Date);SaveTasks();RefreshTaskList();RefreshCalendarView();}; menu.Items.Add(delToday); var delAll=new MenuItem{Header=Localization.T("删除整个循环任务")}; delAll.Click+=(s,e)=>{task.IsDeleted=true;task.DeletedAt=DateTime.Now;SaveTasks();RefreshTaskList();RefreshHistoryList();RefreshCalendarView();};menu.Items.Add(delAll); }
+            else { var del=new MenuItem{Header=Localization.T("删除任务")}; del.Click+=(s,e)=>{task.IsDeleted=true;task.DeletedAt=DateTime.Now;SaveTasks();RefreshTaskList();RefreshHistoryList();RefreshCalendarView();};menu.Items.Add(del); }
             taskCard.ContextMenu=menu; itemContainer.Children.Add(taskCard);
         }
 
@@ -1879,13 +1884,14 @@ namespace DesktopCalendarWidget
             var historyRecords = new List<(TaskItemData Task, DateTime Date)>();
             foreach (var task in _allTasks)
             {
-                foreach (var date in task.CompletedDates)
-                {
-                    historyRecords.Add((task, date));
-                }
+                foreach (var date in task.CompletedDates ?? new HashSet<DateTime>())
+                    historyRecords.Add((task, date.Date));
+
+                if (task.IsDeleted && !(task.CompletedDates?.Any() ?? false))
+                    historyRecords.Add((task, (task.DeletedAt ?? DateTime.Now).Date));
             }
 
-            historyRecords = historyRecords.OrderByDescending(r => r.Date).ToList();
+            historyRecords = historyRecords.OrderByDescending(r => r.Date).ThenBy(r => r.Task.Title).ToList();
 
             if (historyRecords.Count == 0)
             {
@@ -1901,14 +1907,7 @@ namespace DesktopCalendarWidget
 
             foreach (var record in historyRecords)
             {
-                Border itemCard = new Border
-                {
-                    Background = GetThemeBrush("CardBg"),
-                    CornerRadius = new CornerRadius(6),
-                    Padding = new Thickness(8),
-                    Margin = new Thickness(0, 0, 0, 8)
-                };
-
+                Border itemCard = new Border { Background = GetThemeBrush("CardBg"), CornerRadius = new CornerRadius(6), Padding = new Thickness(8), Margin = new Thickness(0, 0, 0, 8) };
                 Grid cardGrid = new Grid();
                 cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
                 cardGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -1916,67 +1915,43 @@ namespace DesktopCalendarWidget
 
                 StackPanel spInfo = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
                 var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
-                titleRow.Children.Add(new TextBlock { Text = record.Task.Title, Foreground = GetThemeBrush("TextPrimary"), FontWeight = FontWeights.Bold, FontSize = 12 });
-                if (HasNotesForTask(record.Task.Id)) { var nbtn = new Button { Content = "📝", Background = GetThemeBrush("ControlBg"), Foreground = GetThemeBrush("AccentLightBrush"), BorderThickness = new Thickness(0), Padding = new Thickness(5,2,5,2), Cursor = Cursors.Hand, ToolTip = Localization.T("查看任务便签") }; nbtn.Click += (s,e)=>OpenTaskNotes(record.Task); titleRow.Children.Add(nbtn); }
+                string displayTitle = record.Task.Title + (record.Task.IsDeleted ? (Localization.IsEnglish ? " (Delete)" : "（删除）") : string.Empty);
+                titleRow.Children.Add(new TextBlock { Text = displayTitle, Foreground = GetThemeBrush("TextPrimary"), FontWeight = FontWeights.Bold, FontSize = 12 });
+                if (!record.Task.IsDeleted && HasNotesForTask(record.Task.Id))
+                {
+                    var nbtn = new Button { Content = "📝", Background = GetThemeBrush("ControlBg"), Foreground = GetThemeBrush("AccentLightBrush"), BorderThickness = new Thickness(0), Padding = new Thickness(5,2,5,2), Cursor = Cursors.Hand, ToolTip = Localization.T("查看任务便签") };
+                    nbtn.Click += (s,e) => OpenTaskNotes(record.Task);
+                    titleRow.Children.Add(nbtn);
+                }
                 spInfo.Children.Add(titleRow);
-                spInfo.Children.Add(new TextBlock
-                {
-                    Text = $"📅 {record.Date:yyyy-MM-dd}",
-                    Foreground = GetThemeBrush("AccentLightBrush"),
-                    FontSize = 10,
-                    Margin = new Thickness(0, 2, 0, 0)
-                });
+                spInfo.Children.Add(new TextBlock { Text = $"📅 {record.Date:yyyy-MM-dd}", Foreground = GetThemeBrush("AccentLightBrush"), FontSize = 10, Margin = new Thickness(0, 2, 0, 0) });
 
-                Button btnUndo = new Button
-                {
-                    Content = Localization.T("撤回"),
-                    Background = GetThemeBrush("AccentBrush"),
-                    Foreground = Brushes.White,
-                    Padding = new Thickness(6, 2, 6, 2),
-                    Margin = new Thickness(4, 0, 2, 0),
-                    Cursor = Cursors.Hand,
-                    FontSize = 11,
-                    ToolTip = Localization.T("恢复为未打卡状态")
-                };
+                Button btnUndo = new Button { Content = Localization.T("撤回"), Background = GetThemeBrush("AccentBrush"), Foreground = Brushes.White, Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(4, 0, 2, 0), Cursor = Cursors.Hand, FontSize = 11, ToolTip = record.Task.IsDeleted ? Localization.T("恢复已删除任务") : Localization.T("恢复为未打卡状态") };
                 btnUndo.Click += (s, ev) =>
                 {
-                    record.Task.CompletedDates.Remove(record.Date);
-                    SaveTasks();
-                    RefreshHistoryList();
-                    RefreshTaskList();
-                    RefreshCalendarView();
+                    if (record.Task.IsDeleted)
+                    {
+                        record.Task.IsDeleted = false;
+                        record.Task.DeletedAt = null;
+                    }
+                    else
+                    {
+                        record.Task.CompletedDates.RemoveWhere(d => d.Date == record.Date.Date);
+                    }
+                    SaveTasks(); RefreshHistoryList(); RefreshTaskList(); RefreshCalendarView();
                 };
 
-                Button btnDelete = new Button
-                {
-                    Content = Localization.T("删除"),
-                    Background = (Brush?)new BrushConverter().ConvertFrom("#DC2626") ?? Brushes.Red,
-                    Foreground = Brushes.White,
-                    Padding = new Thickness(6, 2, 6, 2),
-                    Margin = new Thickness(2, 0, 0, 0),
-                    Cursor = Cursors.Hand,
-                    FontSize = 11,
-                    ToolTip = Localization.T("彻底删除此任务")
-                };
+                Button btnDelete = new Button { Content = Localization.T("删除"), Background = (Brush?)new BrushConverter().ConvertFrom("#DC2626") ?? Brushes.Red, Foreground = Brushes.White, Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(2, 0, 0, 0), Cursor = Cursors.Hand, FontSize = 11, ToolTip = Localization.T("彻底删除此任务") };
                 btnDelete.Click += (s, ev) =>
                 {
                     _allTasks.Remove(record.Task);
-                    SaveTasks();
-                    RefreshHistoryList();
-                    RefreshTaskList();
-                    RefreshCalendarView();
+                    _allNotes.RemoveAll(n => n.TaskId == record.Task.Id);
+                    SaveTasks(); SaveNotes(); RefreshHistoryList(); RefreshTaskList(); RefreshCalendarView();
                 };
 
-                Grid.SetColumn(spInfo, 0);
-                Grid.SetColumn(btnUndo, 1);
-                Grid.SetColumn(btnDelete, 2);
-
-                cardGrid.Children.Add(spInfo);
-                cardGrid.Children.Add(btnUndo);
-                cardGrid.Children.Add(btnDelete);
-
-                itemCard.Child = cardGrid;
-                HistoryListPanel.Children.Add(itemCard);
+                Grid.SetColumn(spInfo, 0); Grid.SetColumn(btnUndo, 1); Grid.SetColumn(btnDelete, 2);
+                cardGrid.Children.Add(spInfo); cardGrid.Children.Add(btnUndo); cardGrid.Children.Add(btnDelete);
+                itemCard.Child = cardGrid; HistoryListPanel.Children.Add(itemCard);
             }
         }
 

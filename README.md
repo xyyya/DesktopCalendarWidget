@@ -13,11 +13,11 @@
 - 勾选已完成任务后，自动排序下沉至列表末尾。
 - 支持靠屏幕边缘自动隐藏，鼠标悬停时唤出。
 - 内嵌抽屉查看历史打卡记录，支持一键撤回。
-- 现支持辅助养成喝水习惯，可自主调整设定
+- 现支持辅助养成喝水习惯，可自主调整设定。
 - 新增分组系统，可为任务添加分组，避免看到一堆任务然后两眼一黑
 - 新增便签系统，可独立显示，可关联到任务里作为笔记一样的存在
 - 便签同样可以贴边隐藏，不会影响日常使用
-- 现支持中英文切换（应该没问题了）
+- 现支持中英文切换（应该没问题）
 - 一切具体更新可以看release，或者自己上手用用，我懒得写这个.jpg
 
 ## 🛠️ 技术栈
@@ -28,26 +28,4 @@
 
 也欢迎高人拿去改（）
 
-## 🌐 Language / 语言
 
-The application now supports two UI languages:
-
-- 简体中文 (Simplified Chinese)
-- English
-
-Open **Settings → Language** to switch. The choice is saved in `settings.json` and will be restored on the next launch. Existing task, group, and note data is not translated or modified.
-
-### Build bilingual Windows release
-
-Run `Build-Bilingual-Release.bat` on a Windows machine with the .NET 8 SDK installed. It publishes a self-contained `win-x64` single-file executable into the `publish` folder.
-
-
-## v22 修复
-- 任务完成刷新时不再通过切换 SelectedDate 触发额外的任务列表重建，避免分组状态被重复覆盖。
-- Expander 展开/收起状态实时记录，并在模板加载完成后恢复。
-- 点击任务复选框时会先保存其父级 Expander 状态。
-
-## v19 修复
-- 修复分组标题显示为 `System.Windows.Controls.StackPanel` 的问题。
-- 新建子分组时正确保存所选父分组的 `ParentGroupId`。
-- 浮动便签保持 `ShowInTaskbar=false`，并额外设置为 owned tool window，避免出现在任务栏/Alt+Tab 中。
