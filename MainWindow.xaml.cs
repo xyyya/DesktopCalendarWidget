@@ -1871,9 +1871,22 @@ namespace DesktopCalendarWidget
             taskCard.Child=cardGrid;
             ContextMenu menu=new ContextMenu(); var edit=new MenuItem{Header=Localization.T("编辑任务")}; edit.Click+=(s,e)=>OpenTaskEditDrawer(task); menu.Items.Add(edit);
             var addNote=new MenuItem{Header=Localization.T("新建/查看便签")}; addNote.Click+=(s,e)=>OpenTaskNotes(task); menu.Items.Add(addNote);
-            if (task.IsRecurring) { var delToday=new MenuItem{Header=Localization.T("仅删除本日任务")}; delToday.Click+=(s,e)=>{task.SkippedDates.Add(taskItemDate.Date);SaveTasks();RefreshTaskList();RefreshCalendarView();}; menu.Items.Add(delToday); var delAll=new MenuItem{Header=Localization.T("删除整个循环任务")}; delAll.Click+=(s,e)=>{task.IsDeleted=true;task.DeletedAt=DateTime.Now;SaveTasks();RefreshTaskList();RefreshHistoryList();RefreshCalendarView();};menu.Items.Add(delAll); }
-            else { var del=new MenuItem{Header=Localization.T("删除任务")}; del.Click+=(s,e)=>{task.IsDeleted=true;task.DeletedAt=DateTime.Now;SaveTasks();RefreshTaskList();RefreshHistoryList();RefreshCalendarView();};menu.Items.Add(del); }
+            if (task.IsRecurring) { var delToday=new MenuItem{Header=Localization.T("仅删除本日任务")}; delToday.Click+=(s,e)=>{task.SkippedDates.Add(taskItemDate.Date);SaveTasks();RefreshTaskList();RefreshCalendarView();}; menu.Items.Add(delToday); var delAll=new MenuItem{Header=Localization.T("删除整个循环任务")}; delAll.Click += (s, e) => SoftDeleteTask(task);menu.Items.Add(delAll); }
+            else { var del=new MenuItem{Header=Localization.T("删除任务")}; del.Click += (s, e) => SoftDeleteTask(task);menu.Items.Add(del); }
             taskCard.ContextMenu=menu; itemContainer.Children.Add(taskCard);
+        }
+
+        // Soft-delete a task: keep it in _allTasks so it can appear in History and be restored.
+        private void SoftDeleteTask(TaskItemData task)
+        {
+            if (task == null) return;
+
+            task.IsDeleted = true;
+            task.DeletedAt = DateTime.Now;
+            SaveTasks();
+            RefreshTaskList();
+            RefreshHistoryList();
+            RefreshCalendarView();
         }
 
         private void RefreshHistoryList()
@@ -1881,17 +1894,29 @@ namespace DesktopCalendarWidget
             if (HistoryListPanel == null) return;
             HistoryListPanel.Children.Clear();
 
-            var historyRecords = new List<(TaskItemData Task, DateTime Date)>();
+            // A history record is either a normal completion record or the deletion event itself.
+            // Keeping the deletion event separate guarantees that deleting an unfinished task still
+            // creates a history entry, while restoring it removes the deletion entry automatically.
+            var historyRecords = new List<(TaskItemData Task, DateTime Date, bool IsDeletionRecord)>();
             foreach (var task in _allTasks)
             {
                 foreach (var date in task.CompletedDates ?? new HashSet<DateTime>())
-                    historyRecords.Add((task, date.Date));
+                    historyRecords.Add((task, date.Date, false));
 
-                if (task.IsDeleted && !(task.CompletedDates?.Any() ?? false))
-                    historyRecords.Add((task, (task.DeletedAt ?? DateTime.Now).Date));
+                if (task.IsDeleted)
+                {
+                    DateTime deletedDate = (task.DeletedAt ?? DateTime.Now).Date;
+                    bool alreadyRepresentedByCompletion = (task.CompletedDates ?? new HashSet<DateTime>())
+                        .Any(d => d.Date == deletedDate);
+                    if (!alreadyRepresentedByCompletion)
+                        historyRecords.Add((task, deletedDate, true));
+                }
             }
 
-            historyRecords = historyRecords.OrderByDescending(r => r.Date).ThenBy(r => r.Task.Title).ToList();
+            historyRecords = historyRecords
+                .OrderByDescending(r => r.Date)
+                .ThenBy(r => r.Task.Title)
+                .ToList();
 
             if (historyRecords.Count == 0)
             {
