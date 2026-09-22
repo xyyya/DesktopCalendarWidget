@@ -1949,7 +1949,8 @@ namespace DesktopCalendarWidget
 
                 StackPanel spInfo = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
                 var titleRow = new StackPanel { Orientation = Orientation.Horizontal };
-                string displayTitle = record.Task.Title + (record.Task.IsDeleted ? (Localization.IsEnglish ? " (Delete)" : "（删除）") : string.Empty);
+                bool isDeletionRecord = record.IsDeletionRecord || record.Task.IsDeleted;
+                string displayTitle = record.Task.Title + (isDeletionRecord ? (Localization.IsEnglish ? " (Delete)" : "（删除）") : string.Empty);
                 titleRow.Children.Add(new TextBlock { Text = displayTitle, Foreground = GetThemeBrush("TextPrimary"), FontWeight = FontWeights.Bold, FontSize = 12 });
                 if (!record.Task.IsDeleted && HasNotesForTask(record.Task.Id))
                 {
@@ -1960,7 +1961,7 @@ namespace DesktopCalendarWidget
                 spInfo.Children.Add(titleRow);
                 spInfo.Children.Add(new TextBlock { Text = $"📅 {record.Date:yyyy-MM-dd}", Foreground = GetThemeBrush("AccentLightBrush"), FontSize = 10, Margin = new Thickness(0, 2, 0, 0) });
 
-                Button btnUndo = new Button { Content = Localization.T("撤回"), Background = GetThemeBrush("AccentBrush"), Foreground = Brushes.White, Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(4, 0, 2, 0), Cursor = Cursors.Hand, FontSize = 11, ToolTip = record.Task.IsDeleted ? Localization.T("恢复已删除任务") : Localization.T("恢复为未打卡状态") };
+                Button btnUndo = new Button { Content = Localization.T("撤回"), Background = GetThemeBrush("AccentBrush"), Foreground = Brushes.White, Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(4, 0, 2, 0), Cursor = Cursors.Hand, FontSize = 11, ToolTip = isDeletionRecord ? Localization.T("恢复已删除任务") : Localization.T("恢复为未打卡状态") };
                 btnUndo.Click += (s, ev) =>
                 {
                     if (record.IsDeletionRecord)
