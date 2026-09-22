@@ -168,6 +168,9 @@ namespace DesktopCalendarWidget
             public bool ShowInCalendar { get; set; } = true;
             public HashSet<DateTime> CompletedDates { get; set; } = new HashSet<DateTime>();
             public HashSet<DateTime> SkippedDates { get; set; } = new HashSet<DateTime>();
+            // For recurring tasks, record occurrences explicitly deleted for a specific day.
+            // This is separate from SkippedDates so History can distinguish a deletion from a normal skip.
+            public HashSet<DateTime> DeletedDates { get; set; } = new HashSet<DateTime>();
             // Deleted tasks remain in history and can be restored or permanently removed.
             public bool IsDeleted { get; set; } = false;
             public DateTime? DeletedAt { get; set; }
@@ -1871,7 +1874,7 @@ namespace DesktopCalendarWidget
             taskCard.Child=cardGrid;
             ContextMenu menu=new ContextMenu(); var edit=new MenuItem{Header=Localization.T("编辑任务")}; edit.Click+=(s,e)=>OpenTaskEditDrawer(task); menu.Items.Add(edit);
             var addNote=new MenuItem{Header=Localization.T("新建/查看便签")}; addNote.Click+=(s,e)=>OpenTaskNotes(task); menu.Items.Add(addNote);
-            if (task.IsRecurring) { var delToday=new MenuItem{Header=Localization.T("仅删除本日任务")}; delToday.Click+=(s,e)=>{task.SkippedDates.Add(taskItemDate.Date);SaveTasks();RefreshTaskList();RefreshCalendarView();}; menu.Items.Add(delToday); var delAll=new MenuItem{Header=Localization.T("删除整个循环任务")}; delAll.Click += (s, e) => SoftDeleteTask(task);menu.Items.Add(delAll); }
+            if (task.IsRecurring) { var delToday=new MenuItem{Header=Localization.T("仅删除本日任务")}; delToday.Click+=(s,e)=>{var d=taskItemDate.Date; task.SkippedDates.Add(d); task.DeletedDates ??= new HashSet<DateTime>(); task.DeletedDates.Add(d); SaveTasks(); RefreshTaskList(); RefreshHistoryList(); RefreshCalendarView();}; menu.Items.Add(delToday); var delAll=new MenuItem{Header=Localization.T("删除整个循环任务")}; delAll.Click += (s, e) => SoftDeleteTask(task);menu.Items.Add(delAll); }
             else { var del=new MenuItem{Header=Localization.T("删除任务")}; del.Click += (s, e) => SoftDeleteTask(task);menu.Items.Add(del); }
             taskCard.ContextMenu=menu; itemContainer.Children.Add(taskCard);
         }
@@ -1903,12 +1906,18 @@ namespace DesktopCalendarWidget
                 foreach (var date in task.CompletedDates ?? new HashSet<DateTime>())
                     historyRecords.Add((task, date.Date, false));
 
+                // A recurring task can delete only today's occurrence. Those dates must appear in History too.
+                foreach (var deletedDate in task.DeletedDates ?? new HashSet<DateTime>())
+                    historyRecords.Add((task, deletedDate.Date, true));
+
                 if (task.IsDeleted)
                 {
                     DateTime deletedDate = (task.DeletedAt ?? DateTime.Now).Date;
                     bool alreadyRepresentedByCompletion = (task.CompletedDates ?? new HashSet<DateTime>())
                         .Any(d => d.Date == deletedDate);
-                    if (!alreadyRepresentedByCompletion)
+                    bool alreadyRepresentedByDeletedDate = (task.DeletedDates ?? new HashSet<DateTime>())
+                        .Any(d => d.Date == deletedDate);
+                    if (!alreadyRepresentedByCompletion && !alreadyRepresentedByDeletedDate)
                         historyRecords.Add((task, deletedDate, true));
                 }
             }
@@ -1954,10 +1963,18 @@ namespace DesktopCalendarWidget
                 Button btnUndo = new Button { Content = Localization.T("撤回"), Background = GetThemeBrush("AccentBrush"), Foreground = Brushes.White, Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(4, 0, 2, 0), Cursor = Cursors.Hand, FontSize = 11, ToolTip = record.Task.IsDeleted ? Localization.T("恢复已删除任务") : Localization.T("恢复为未打卡状态") };
                 btnUndo.Click += (s, ev) =>
                 {
-                    if (record.Task.IsDeleted)
+                    if (record.IsDeletionRecord)
                     {
-                        record.Task.IsDeleted = false;
-                        record.Task.DeletedAt = null;
+                        if (record.Task.IsDeleted)
+                        {
+                            record.Task.IsDeleted = false;
+                            record.Task.DeletedAt = null;
+                        }
+                        else
+                        {
+                            record.Task.DeletedDates?.RemoveWhere(d => d.Date == record.Date.Date);
+                            record.Task.SkippedDates?.RemoveWhere(d => d.Date == record.Date.Date);
+                        }
                     }
                     else
                     {
